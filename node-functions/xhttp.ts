@@ -191,15 +191,44 @@ export async function onRequest(context: any) {
       }
       addr = parsed.addressRemote;
       port = parsed.portRemote;
+      // 关键：剥离 VLESS 头，只把 payload 发给远端（此前误发整个帧导致远端收到二进制垃圾）
+      const payload: Buffer = uplink.subarray(parsed.rawDataIndex);
+
+      // VLESS UDP 命令（command=2）：复用已验证可用的 dgram 逐包中继
+      if (parsed.isUDP) {
+        const { relayPacket } = await import('./udp.ts');
+        const r = await relayPacket(addr, port, payload);
+        if (!r.available) {
+          return json({ error: '平台运行时未提供 node:dgram，UDP 不可用', addr, port }, 502);
+        }
+        if (!r.ok) {
+          return json(
+            { error: 'UDP 已发送但无响应（可能被环境过滤）', addr, port, sent: r.sent, ms: r.ms, ...(r.error ? { relayError: r.error } : {}) },
+            502
+          );
+        }
+        return new Response(r.body, {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'Cache-Control': 'no-store',
+            'X-EO-Tunnel': `vless-udp ${addr}:${port} uplink=${payload.length}(${how})`,
+            'X-UDP-Responses': String(r.responses),
+            'X-UDP-Bytes': String(r.bytes),
+            'X-UDP-Ms': String(r.ms),
+          },
+        });
+      }
+
       const vlessRespHeader = Buffer.from([parsed.vlessVersion[0], 0]);
-      const result = runTunnel(addr, port, uplink, 'vless', proxyIP, vlessRespHeader);
+      const result = runTunnel(addr, port, payload, 'vless', proxyIP, vlessRespHeader);
       return new Response(result.stream, {
         status: 200,
         headers: {
           'Content-Type': 'application/octet-stream',
           'X-Accel-Buffering': 'no',
           'Cache-Control': 'no-store',
-          'X-EO-Tunnel': `vless ${addr}:${port} uplink=${uplink.length}(${how})`,
+          'X-EO-Tunnel': `vless ${addr}:${port} uplink=${payload.length}(${how})`,
         },
       });
     }

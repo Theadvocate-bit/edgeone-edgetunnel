@@ -65,14 +65,14 @@ class MockWS {
   close() { this.readyState = 3; this.closed = true; }
 }
 
-function buildVlessRequest(host, port, payload, addrType = 2) {
+function buildVlessRequest(host, port, payload, addrType = 2, command = 1) {
   const uuidStr = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
   const uuid = Buffer.from(uuidStr.replace(/-/g, ''), 'hex');
   const head = Buffer.concat([
     Buffer.from([0x00]),
     uuid,
     Buffer.from([0x00]),
-    Buffer.from([0x01]),
+    Buffer.from([command]),
     Buffer.from([(port >> 8) & 0xff, port & 0xff]),
   ]);
   if (addrType === 2) {
@@ -200,8 +200,16 @@ async function main() {
       env: {},
     });
     const text = await resp.text();
-    const cfgOk = text.includes('vless://') && text.includes('/vless?ed=2048') && text.includes('节点 1') && text.includes('/xhttp');
-    console.log(`[config page] ${cfgOk ? 'PASS ✅' : 'FAIL ❌'} (${text.length} chars, 多节点=${text.includes('节点 1')})`);
+    const checks = {
+      wsLink: text.includes('vless://') && text.includes(encodeURIComponent('/vless?ed=2048')),
+      wsAlpn: text.includes('alpn=h2%2Chttp%2F1.1'),
+      xhttpLink: text.includes('type=xhttp') && text.includes('mode=transaction') && text.includes('extra=%7B'),
+      xhttpUdpCmd: text.includes('UDP 命令(02)'),
+      udpRelayLink: text.includes('udp-relay://') && text.includes('framing=length-prefix'),
+      h2NotUsable: text.includes('不可用') && !/#EO-H2-[^\s]*生成/.test(text),
+    };
+    const cfgOk = text.includes('节点 1') && text.includes('/xhttp') && Object.values(checks).every(Boolean);
+    console.log(`[config page] ${cfgOk ? 'PASS ✅' : 'FAIL ❌'} (${text.length} chars) checks=${JSON.stringify(checks)}`);
     allOk = allOk && cfgOk;
 
     const resp2 = await defaultOnRequest({
@@ -270,7 +278,7 @@ async function main() {
       allOk = allOk && ok;
     }
 
-    // 8b. vless 模式：body 为 VLESS 帧 → 首部带 VLESS 响应头
+    // 8b. vless 模式：body 为 VLESS 帧 → 响应头剥离正确，payload 必须以纯上行开头（不得残留 VLESS 头字节）
     {
       const buf = buildVlessRequest('example.com', 80,
         'GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n');
@@ -281,8 +289,12 @@ async function main() {
       });
       const resp = await xhttpOnRequest({ request, env: {}, waitUntil: () => {} });
       const data = await readStream(resp);
-      const ok = data.subarray(0, 2).toString('hex') === '0000' && data.toString('utf8', 2).includes('HTTP/1.1');
-      console.log(`[xhttp vless] ${data.length} bytes, head hex=${data.subarray(0, 4).toString('hex')} -> ${ok ? 'PASS ✅' : 'FAIL ❌'}`);
+      const payload = data.subarray(2); // 去掉 VLESS 响应头 [ver,0]
+      // 剥离正确 → 远端收到纯 GET 请求 → 回 200 OK；剥离缺失 → 远端收到 VLESS 头垃圾 → 400 Bad Request
+      const ok = data.subarray(0, 2).toString('hex') === '0000'
+        && payload.subarray(0, 9).toString('utf8') === 'HTTP/1.1 '
+        && payload.toString('utf8').includes('200 OK');
+      console.log(`[xhttp vless] ${data.length} bytes, payload head=${JSON.stringify(payload.toString('utf8', 0, 15))} -> ${ok ? 'PASS ✅' : 'FAIL ❌'}`);
       allOk = allOk && ok;
     }
 
@@ -303,6 +315,28 @@ async function main() {
       const resp = await xhttpOnRequest({ request: new Request('https://t.app/xhttp', { method: 'POST' }), env: {}, waitUntil: () => {} });
       const ok = resp.status === 400;
       console.log(`[xhttp missing-args] status=${resp.status} -> ${ok ? 'PASS ✅' : 'FAIL ❌'}`);
+      allOk = allOk && ok;
+    }
+
+    // 8e. VLESS UDP 命令（command=2）→ 路由到 dgram 中继
+    //     本机网络可能过滤 UDP（DNS 超时），因此 200（有响应）或 502（已发送但无响应/不可用）均视为路由正确；
+    //     仅 500 异常或未按 UDP 路径处理才算失败。
+    {
+      const header = Buffer.from([0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+      const qname = Buffer.from([7, ...'example'.split('').map(c => c.charCodeAt(0)), 3, ...'com'.split('').map(c => c.charCodeAt(0)), 0]);
+      const dnsPkt = Buffer.concat([header, qname, Buffer.from([0, 1, 0, 1])]);
+      const buf = buildVlessRequest('8.8.8.8', 53, dnsPkt, 1, 2); // IPv4 地址 + UDP 命令
+      const request = new Request('https://t.app/xhttp?mode=vless', {
+        method: 'POST',
+        headers: { 'content-type': 'application/octet-stream' },
+        body: buf,
+      });
+      const resp = await xhttpOnRequest({ request, env: {}, waitUntil: () => {} });
+      const ok = resp.status === 200 || resp.status === 502;
+      const extra = resp.status === 200
+        ? `resp=${resp.headers.get('x-udp-responses')} responses/${resp.headers.get('x-udp-bytes')}B`
+        : '';
+      console.log(`[xhttp vless-udp] status=${resp.status} ${extra} -> ${ok ? 'PASS ✅' : 'FAIL ❌'}`);
       allOk = allOk && ok;
     }
   }

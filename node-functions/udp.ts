@@ -91,6 +91,47 @@ function concatWithLengthPrefix(chunks: Buffer[]): Buffer {
 }
 
 /**
+ * 供其他端点（如 xhttp VLESS-UDP）复用的逐包中继：
+ * 内部动态加载 node:dgram，返回拼接好的响应（含长度前缀）与元信息。
+ * dgram 不可用时返回 { available: false }。
+ */
+export async function relayPacket(
+  host: string,
+  port: number,
+  payload: Buffer,
+  timeoutMs = EXCHANGE_TIMEOUT_MS
+): Promise<{
+  available: boolean;
+  sent: boolean;
+  ok: boolean;
+  body: Buffer | null;
+  responses: number;
+  bytes: number;
+  ms: number;
+  error?: string;
+}> {
+  let dgram: any = null;
+  try {
+    const m: any = await import('node:dgram');
+    dgram = m?.default || m;
+  } catch { dgram = null; }
+  if (!dgram || typeof dgram.createSocket !== 'function') {
+    return { available: false, sent: false, ok: false, body: null, responses: 0, bytes: 0, ms: 0 };
+  }
+  const r = await udpExchange(dgram, payload, host, port, timeoutMs);
+  return {
+    available: true,
+    sent: r.sent,
+    ok: r.ok,
+    body: r.ok ? concatWithLengthPrefix(r.chunks) : null,
+    responses: r.chunks.length,
+    bytes: r.bytes,
+    ms: r.ms,
+    ...(r.error ? { error: r.error } : {}),
+  };
+}
+
+/**
  * @param {any} context EdgeOne Node Functions EventContext
  */
 export async function onRequest(context: any) {
