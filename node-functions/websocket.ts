@@ -38,7 +38,15 @@ export async function onRequest(context: any) {
         return new Response('Bad WebSocket path', { status: 400 });
       }
       // EdgeOne 官方 WS 升级方式：返回 { websocket: handlers }，平台完成 101 握手并回调事件
-      return { websocket: createVlessWebSocketHandler(request) };
+      const handlers = createVlessWebSocketHandler(request);
+      diag(`upgrade accepted at ${url.pathname}, returning handlers`);
+      // 兼容不同运行时的键名（官方模板为 websocket；附带别名以防派发键名不同）
+      return {
+        websocket: handlers,
+        webSocket: handlers,
+        socket: handlers,
+        ws: handlers,
+      };
     }
 
     // 非 WS 请求打到 /vless：给出提示
@@ -49,6 +57,23 @@ export async function onRequest(context: any) {
   } catch (err: any) {
     return new Response(String(err), { status: 500 });
   }
+}
+
+// ---------------------------------------------------------------------------
+// 模块级 WS 诊断缓冲：记录最近 50 条 WS 事件/异常，供 /debug 端点读取。
+// 用于排查「101 握手成功但事件回调未派发/无数据回传」类平台层问题。
+// ---------------------------------------------------------------------------
+const wsDiag: string[] = [];
+
+function diag(msg: string) {
+  const line = `${new Date().toISOString()} ${msg}`;
+  wsDiag.push(line);
+  if (wsDiag.length > 50) wsDiag.shift();
+  console.log('[ws-diag]', line);
+}
+
+export function getWsDiag(): string[] {
+  return wsDiag;
 }
 
 // ---------------------------------------------------------------------------
@@ -219,10 +244,12 @@ function createVlessWebSocketHandler(request: any) {
   return {
     async onopen(ws: any, req: any) {
       wsRef = ws;
+      diag(`onopen fired, ws keys=[${Object.keys(ws || {}).join(',')}], typeof send=${typeof ws?.send}`);
       log('websocket opened');
       try {
         // 与官方模板一致：open 后立即回发一条消息，验证服务端 send 通道可用
         ws.send('ready');
+        diag("onopen sent 'ready'");
         // 处理 0-RTT early data（v2ray 客户端通过 sec-websocket-protocol 携带）
         const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
         if (error) {
@@ -235,6 +262,7 @@ function createVlessWebSocketHandler(request: any) {
           handleClientChunk(ws, Buffer.from(earlyData));
         }
       } catch (err: any) {
+        diag(`onopen error: ${err?.message || err}`);
         log('onopen error', err);
         try { ws.send(`OPEN-ERR: ${err?.message || err}`); } catch { /* ignore */ }
         try { ws.close(); } catch { /* ignore */ }
@@ -242,6 +270,7 @@ function createVlessWebSocketHandler(request: any) {
     },
 
     async onmessage(ws: any, message: any, isBinary: boolean) {
+      diag(`onmessage fired, len=${message?.byteLength ?? message?.length ?? '?'}, isBinary=${isBinary}`);
       wsRef = ws;
       try {
         const chunk = toBuffer(message, isBinary);
@@ -255,6 +284,7 @@ function createVlessWebSocketHandler(request: any) {
     },
 
     onclose(ws: any, code: number, reason: Buffer) {
+      diag(`onclose fired, code=${code}, reason=${reason?.toString?.() || ''}`);
       log('websocket closed', `${code} ${reason?.toString?.() || ''}`);
       if (remoteSocket) {
         remoteSocket.destroy();
@@ -263,6 +293,7 @@ function createVlessWebSocketHandler(request: any) {
     },
 
     onerror(ws: any, error: Error) {
+      diag(`onerror fired: ${error?.message || error}`);
       log('websocket error', error?.message || error);
       try { if (isWsOpen(ws)) ws.send(`WS-ERR: ${error?.message || error}`); } catch { /* ignore */ }
       if (remoteSocket) {

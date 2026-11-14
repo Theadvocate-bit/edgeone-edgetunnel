@@ -7,7 +7,7 @@
 
 import dns from 'node:dns';
 import net from 'node:net';
-import { getVLESSConfig } from './websocket.ts';
+import { getVLESSConfig, getWsDiag } from './websocket.ts';
 
 let userID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
 let proxyIP = '';
@@ -43,6 +43,7 @@ export async function onRequest(context: any) {
           if (/host|forward|origin|referer|x-real|eo-/i.test(k)) fwdHeaders[k] = v;
         });
         diag.forwardedHeaders = fwdHeaders;
+        diag.wsDiagnostics = getWsDiag();
         return new Response(JSON.stringify(diag, null, 2), {
           status: 200,
           headers: { 'Content-Type': 'application/json;charset=utf-8' },
