@@ -4,5 +4,14 @@
   "private": true,
   "description": "VLESS over WebSocket on EdgeOne Pages (Node Functions), adapted from Cloudflare Worker edgetunnel",
   "license": "GPL-3.0",
-  "type": "module"
+  "type": "commonjs",
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@types/ws": "^8.5.10",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.3.3"
+  }
 }
