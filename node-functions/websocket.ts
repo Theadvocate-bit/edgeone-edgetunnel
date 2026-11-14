@@ -582,37 +582,66 @@ export function processVlessHeader(buf: Buffer, uid: string) {
  * 生成 v2ray / clash-meta 客户端配置文本
  */
 export function getVLESSConfig(uid: string, hostName: string): string {
-  const protocol = 'vless';
-  const wsPath = `${WS_PATH}?ed=2048`;
-  const vlessMain =
-    `${protocol}` +
-    `://${uid}@${hostName}:443` +
-    `?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=${encodeURIComponent(wsPath)}#${hostName}`;
+  const xhttpPath = '/xhttp';
+  const xhttpUri =
+    `vless://${uid}@${hostName}:443` +
+    `?encryption=none&security=tls&sni=${hostName}&fp=randomized&type=xhttp&host=${hostName}&path=${encodeURIComponent(xhttpPath)}#${hostName}-xhttp`;
+
+  const xrayJson = JSON.stringify(
+    {
+      inbounds: [
+        {
+          tag: 'vless-in',
+          port: 10808,
+          listen: '127.0.0.1',
+          protocol: 'socks',
+          settings: { udp: true },
+        },
+      ],
+      outbounds: [
+        {
+          tag: 'vless-out',
+          protocol: 'vless',
+          settings: {
+            vnext: [
+              {
+                address: hostName,
+                port: 443,
+                users: [{ id: uid, encryption: 'none' }],
+              },
+            ],
+          },
+          streamSettings: {
+            network: 'xhttp',
+            security: 'tls',
+            tlsSettings: { serverName: hostName, fingerprint: 'chrome' },
+            xhttpSettings: {
+              path: xhttpPath,
+              host: hostName,
+              mode: 'splitted',
+            },
+          },
+        },
+      ],
+    },
+    null,
+    2
+  );
 
   return `
 ################################################################
-v2ray (EdgeOne Pages)
+XHTTP 传输（EdgeOne Pages）— 需较新 Xray-core（>= 1.8.x，支持 xhttp）
 ---------------------------------------------------------------
-${vlessMain}
+Xray 客户端配置（JSON）：
+${xrayJson}
 ---------------------------------------------------------------
-################################################################
-clash-meta
+v2rayNG / NekoBox 分享链接（type=xhttp，需客户端支持）：
+${xhttpUri}
 ---------------------------------------------------------------
-- type: vless
-  name: ${hostName}
-  server: ${hostName}
-  port: 443
-  uuid: ${uid}
-  network: ws
-  tls: true
-  udp: false
-  sni: ${hostName}
-  client-fingerprint: chrome
-  ws-opts:
-    path: "${wsPath}"
-    headers:
-      host: ${hostName}
----------------------------------------------------------------
+说明：
+  - 传输层 type=xhttp（splitted-HTTP），路径 ${xhttpPath}
+  - 上行：POST /xhttp/<uuid>；下行：GET /xhttp/<uuid>?seq=N（长轮询流式）
+  - 平台约 30s 硬超时 => 下行每 ~22s 重连一次（客户端自动处理）
 ################################################################
 `;
 }

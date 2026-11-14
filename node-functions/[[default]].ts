@@ -8,6 +8,7 @@
 import dns from 'node:dns';
 import net from 'node:net';
 import { getVLESSConfig, getWsDiag } from './websocket.ts';
+import { handleXhttp } from './xhttp.ts';
 
 let userID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
 let proxyIP = '';
@@ -35,6 +36,11 @@ export async function onRequest(context: any) {
     }
 
     const url = new URL(request.url);
+
+    // XHTTP 传输：/xhttp/* 交由 xhttp.ts 处理（POST 上行 / GET 下行轮询 / DELETE 关闭）
+    const xhttpResponse = await handleXhttp(context);
+    if (xhttpResponse) return xhttpResponse;
+
     switch (url.pathname) {
       case '/affinity': {
         // 实例亲和性探针：连续访问时 count 递增且 boot 相同 => 有状态会话可行
