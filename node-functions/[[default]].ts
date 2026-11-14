@@ -93,6 +93,39 @@ export async function onRequest(context: any) {
           headers: { 'Content-Type': 'text/plain', 'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store' },
         });
       }
+      case '/xhttp-probe': {
+        // XHTTP 下行长连接可行性探针：模拟 XHTTP 下行——服务端每 1s 推一块，目标持续 60s。
+        // 目的：测 EdgeOne 函数到底允许流式响应挂多久、会不会中途被平台掐断。
+        // 客户端可读 JSON 行，记录 elapsed/seq/bytes，用于判定可行时长。
+        const DURATION_MS = 60_000;
+        const started = Date.now();
+        const stream = new ReadableStream({
+          start(controller) {
+            const enc = new TextEncoder();
+            let seq = 0;
+            const t = setInterval(() => {
+              const elapsed = Date.now() - started;
+              try {
+                const line = JSON.stringify({ seq, elapsed, t: Date.now() }) + '\n';
+                controller.enqueue(enc.encode(line));
+                seq++;
+                if (elapsed >= DURATION_MS) { clearInterval(t); controller.close(); }
+              } catch {
+                // 客户端已断开或流被平台关闭
+                clearInterval(t);
+              }
+            }, 1000);
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/x-ndjson',
+            'X-Accel-Buffering': 'no',
+            'Cache-Control': 'no-store',
+          },
+        });
+      }
       case '/stream-in': {
         // 流式请求体能力探针：读 POST body 的每个 chunk 并记录到达时间
         const bodyType = typeof (request as any).body;
