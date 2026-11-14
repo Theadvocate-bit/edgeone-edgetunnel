@@ -45,6 +45,20 @@ export function getWsDiag(): string[] {
 }
 
 /**
+ * 兼容读取请求头：onRequest 里 headers 是 Headers 实例（有 .get），
+ * 但 WS 回调里平台传入的 request.headers 可能是普通对象（无 .get）。
+ */
+function readHeader(req: any, name: string): string {
+  try {
+    const h = req?.headers;
+    if (!h) return '';
+    if (typeof h.get === 'function') return String(h.get(name) || '');
+    const v = h[name] ?? h[name.toLowerCase()] ?? h[name.replace(/\b\w/g, (c: string) => c.toUpperCase())];
+    return v ? String(v) : '';
+  } catch { return ''; }
+}
+
+/**
  * @param {any} context EdgeOne Node Functions EventContext
  */
 export async function onRequest(context: any) {
@@ -117,7 +131,7 @@ function createVlessConnection(wsRef: { current: any }, request: any): VlessConn
     console.log(`[${address}:${portWithRandomLog}] ${info}`, event || '');
   };
 
-  const earlyDataHeader: string = request?.headers?.get('sec-websocket-protocol') || '';
+  const earlyDataHeader: string = readHeader(request, 'sec-websocket-protocol');
 
   let remoteSocket: any = null;
   let vlessHeaderPending: Buffer | null = null;
@@ -297,7 +311,7 @@ function createVlessWebSocketHandler(request: any) {
   return {
     async onopen(ws: any, req: any) {
       wsRef.current = ws;
-      report('onopen', `keys=[${Object.keys(ws || {}).join(',')}], send=${typeof ws?.send}`);
+      report('onopen', `keys=[${Object.keys(ws || {}).slice(0, 8).join(',')}], send=${typeof ws?.send}, headersType=${req?.headers?.constructor?.name || typeof req?.headers}`);
       try {
         ws.send('ready');
         report("onopen sent 'ready'");
@@ -359,7 +373,7 @@ function wirePairServer(server: any, request: any) {
     const ensureConn = () => conn || (conn = createVlessConnection(wsRef, request));
 
     // 0-RTT early data
-    const { earlyData, error } = base64ToArrayBuffer(request?.headers?.get('sec-websocket-protocol') || '');
+    const { earlyData, error } = base64ToArrayBuffer(readHeader(request, 'sec-websocket-protocol'));
     if (error) {
       report('pair mode: early data decode error', error?.message || error);
     } else if (earlyData) {
