@@ -55,6 +55,9 @@ edgeone pages deploy # 部署
 |---|---|---|
 | `UUID` | 否 | VLESS 鉴权 UUID。不设置时使用内置默认值 `d342d11e-d424-4583-b36e-524ab1f0afa4`，**生产环境务必自定义** |
 | `PROXYIP` | 否 | 目标直连失败（无回源数据）时，改用该 IP 出站重试 |
+| `CUSTOM_DOMAIN` | 否 | **自定义域名场景强烈推荐**：强制配置生成使用该域名（address/sni/host 全部跟随）。不设置时按 `X-Forwarded-Host` > `url.hostname` > `Host` 自动解析 |
+
+**为什么推荐设置 `CUSTOM_DOMAIN`**：Pages 平台把请求转发给函数时，`Host` 头可能被改写为内部回源地址——不显式指定的话，生成的客户端配置里 SNI/Host/address 可能跟不到自定义域名，导致 TLS 握手失败。设置后（如 `CUSTOM_DOMAIN=my.domain.com`）所有配置项一律使用该域名。可通过 `/debug` 端点的 `resolvedHost` 字段确认当前解析结果。
 
 生成 UUID（Windows PowerShell）：
 

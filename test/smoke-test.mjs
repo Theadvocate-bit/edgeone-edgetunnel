@@ -115,6 +115,36 @@ async function main() {
     allOk = allOk && resp2.status === 426;
   }
 
+  // --- 6. 自定义域名跟随：Host 被平台改写时的域名解析链 ---
+  {
+    const uuid = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
+    const checkHost = async (label, req, env, expect) => {
+      const t = await (await defaultOnRequest({ request: req, env })).text();
+      // vlessMain 里 address/sni/host 都用同一 hostName
+      const ok = t.includes(`@${expect}:443`) && t.includes(`sni=${expect}`);
+      console.log(`[custom-host:${label}] ${ok ? 'PASS ✅' : 'FAIL ❌'} (期望 ${expect})`);
+      return ok;
+    };
+
+    // a. Host 被改写为内部地址，但 X-Forwarded-Host 保留自定义域名
+    allOk = await checkHost('x-forwarded-host',
+      new Request(`https://internal.edgeone.internal/${uuid}`, {
+        headers: { host: 'internal.edgeone.internal', 'x-forwarded-host': 'my.domain.com' },
+      }), {}, 'my.domain.com') && allOk;
+
+    // b. 设置 CUSTOM_DOMAIN 环境变量后强制生效（最高优先级）
+    allOk = await checkHost('custom-domain-env',
+      new Request(`https://whatever.example.com/${uuid}`, {
+        headers: { host: 'whatever.example.com', 'x-forwarded-host': 'ignored.com' },
+      }), { CUSTOM_DOMAIN: 'my.custom.domain' }, 'my.custom.domain') && allOk;
+
+    // c. 无转发头时回退到 url.hostname（而非被改写的 Host 头）
+    allOk = await checkHost('url-hostname-fallback',
+      new Request(`https://site.edgeone.app/${uuid}`, {
+        headers: { host: 'rewritten.internal' },
+      }), {}, 'site.edgeone.app') && allOk;
+  }
+
   console.log(allOk ? 'ALL TESTS PASS ✅' : 'SOME TESTS FAILED ❌');
   process.exit(allOk ? 0 : 1);
 }

@@ -36,13 +36,14 @@ export async function onRequest(context: any) {
       case '/debug': {
         // 自诊断端点：检查 DNS 与出站 TCP 是否可用
         const diag = await handleDebug();
+        diag.resolvedHost = resolveHostName(request, env); // 供确认配置生成所用的域名
         return new Response(JSON.stringify(diag, null, 2), {
           status: 200,
           headers: { 'Content-Type': 'application/json;charset=utf-8' },
         });
       }
       case `/${userID}`: {
-        const hostName = request.headers.get('Host') || url.hostname;
+        const hostName = resolveHostName(request, env);
         return new Response(getVLESSConfig(userID, hostName), {
           status: 200,
           headers: { 'Content-Type': 'text/plain;charset=utf-8' },
@@ -56,6 +57,39 @@ export async function onRequest(context: any) {
   } catch (err: any) {
     return new Response(String(err), { status: 500 });
   }
+}
+
+// ---------------------------------------------------------------------------
+// 域名解析（配置生成用：address / sni / host 必须跟随用户实际访问的域名）
+// ---------------------------------------------------------------------------
+
+/**
+ * 解析客户端配置应使用的域名。
+ * 优先级：CUSTOM_DOMAIN 环境变量 > X-Forwarded-Host > url.hostname > Host 头。
+ *
+ * 背景：Pages 平台把请求转发给函数时，Host 头可能被改写为内部回源地址，
+ * 直接用 Host 头生成的配置会导致客户端 SNI/Host/address 跟不到自定义域名。
+ */
+function resolveHostName(request: any, env: any): string {
+  // 1. 显式指定（自定义域名场景最可靠，推荐）
+  const custom = env?.CUSTOM_DOMAIN || env?.DOMAIN;
+  if (custom) {
+    return String(custom).trim().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  }
+  // 2. 反代平台保留的原始域名
+  const xfh = request.headers.get('x-forwarded-host');
+  if (xfh) {
+    return xfh.split(',')[0].trim();
+  }
+  // 3. 请求 URL 的 hostname（排除明显的内部地址）
+  try {
+    const u = new URL(request.url);
+    if (u.hostname && !u.hostname.endsWith('.internal')) {
+      return u.hostname;
+    }
+  } catch { /* ignore */ }
+  // 4. 兜底 Host 头
+  return request.headers.get('host') || '';
 }
 
 // ---------------------------------------------------------------------------
