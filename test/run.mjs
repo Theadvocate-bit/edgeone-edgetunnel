@@ -9,13 +9,9 @@ const root = path.resolve(new URL('..', import.meta.url).pathname.replace(/^\/([
 const tmpDir = path.join(root, '.tmp');
 mkdirSync(tmpDir, { recursive: true });
 
-// 1. esbuild 打包（与平台构建器行为一致）
+// 1. esbuild 打包（与平台构建器行为一致；v14.4 起唯一入口 = [[default]].ts）
 for (const [entry, out] of [
-  ['websocket.ts', 'websocket.mjs'],
-  ['vless.ts', 'vless.mjs'],
   ['[[default]].ts', 'default.mjs'],
-  ['xhttp.ts', 'xhttp.mjs'],
-  ['udp.ts', 'udp.mjs'],
 ]) {
   await build({
     entryPoints: [path.join(root, 'node-functions', entry)],
@@ -27,11 +23,11 @@ for (const [entry, out] of [
   });
 }
 
-const { onRequest: vlessOnRequest } = await import(pathToFileURL(path.join(tmpDir, 'websocket.mjs')).href);
-const { onRequest: vlessRouteOnRequest } = await import(pathToFileURL(path.join(tmpDir, 'vless.mjs')).href);
 const { onRequest: defaultOnRequest } = await import(pathToFileURL(path.join(tmpDir, 'default.mjs')).href);
-const { onRequest: xhttpOnRequest } = await import(pathToFileURL(path.join(tmpDir, 'xhttp.mjs')).href);
-const { onRequest: udpOnRequest } = await import(pathToFileURL(path.join(tmpDir, 'udp.mjs')).href);
+// v14.4 起唯一 onRequest：WS / xhttp / udp 全部经 catch-all 分发
+const vlessOnRequest = defaultOnRequest;
+const xhttpOnRequest = defaultOnRequest;
+const udpOnRequest = defaultOnRequest;
 
 // --- WebSocketPair mock（模拟 CF/EdgeOne pair 模式运行时） ---
 class PairMockWS {
@@ -122,12 +118,12 @@ async function main() {
     const buf = buildVlessRequest('example.com', 80,
       'GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n');
     allOk = (await testWsUpgrade('ws /vless normal', request, buf)) && allOk;
-    // v14.3：vless.ts 瘦路由（/vless 命名路由）独立验证
+    // v14.4：/vless 升级现在统一走 catch-all（唯一 onRequest），二次验证
     {
       const req2 = new Request('https://test.edgeone.app/vless?ed=2048', {
         headers: { upgrade: 'websocket', 'sec-websocket-protocol': '' },
       });
-      allOk = (await testWsUpgrade('ws /vless vless.ts-route', req2, buf, vlessRouteOnRequest)) && allOk;
+      allOk = (await testWsUpgrade('ws /vless catch-all-route', req2, buf)) && allOk;
     }
   }
 
@@ -225,8 +221,8 @@ async function main() {
       request: new Request('https://t.app/anything', { headers: { upgrade: 'websocket' } }),
       env: {},
     });
-    console.log(`[catch-all upgrade] status=${resp2.status} (期望 426)`);
-    allOk = allOk && resp2.status === 426;
+    console.log(`[catch-all upgrade] status=${resp2.status} (期望 400：非 WS 路径拒绝)`);
+    allOk = allOk && resp2.status === 400;
   }
 
   // --- 7. 自定义域名跟随 ---

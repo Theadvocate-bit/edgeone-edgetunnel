@@ -133,7 +133,7 @@ function runTunnel(
   return { stream, dialAddr: address, dialPort: port, uplinkHow: '', uplinkBytes: uplink?.length || 0 };
 }
 
-function json(obj: any, status = 200): Response {
+function jsonXhttp(obj: any, status = 200): Response {
   return new Response(JSON.stringify(obj, null, 2), {
     status,
     headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store' },
@@ -151,7 +151,7 @@ export async function handleXhttp(context: any): Promise<Response> {
 
     // 端点说明
     if (request.method === 'GET' && !sp.get('addr') && !sp.get('d') && sp.get('mode') !== 'vless') {
-      return json({
+      return jsonXhttp({
         endpoint: 'XHTTP transaction tunnel (one request = one transaction)',
         platformConstraints: {
           streamingResponse: 'OK (download direction)',
@@ -181,11 +181,11 @@ export async function handleXhttp(context: any): Promise<Response> {
 
     if (mode === 'vless') {
       if (!uplink || uplink.length < 24) {
-        return json({ error: 'mode=vless 需要 VLESS 帧上行（body 或 d= 参数）', uplinkHow: how }, 400);
+        return jsonXhttp({ error: 'mode=vless 需要 VLESS 帧上行（body 或 d= 参数）', uplinkHow: how }, 400);
       }
       const parsed = processVlessHeader(uplink, String(env?.UUID || 'd342d11e-d424-4583-b36e-524ab1f0afa4'));
       if (parsed.hasError) {
-        return json({ error: `VLESS 头解析失败: ${parsed.message}` }, 400);
+        return jsonXhttp({ error: `VLESS 头解析失败: ${parsed.message}` }, 400);
       }
       addr = parsed.addressRemote;
       port = parsed.portRemote;
@@ -197,10 +197,10 @@ export async function handleXhttp(context: any): Promise<Response> {
         const { relayPacket } = await import('./_udp-core.ts');
         const r = await relayPacket(addr, port, payload);
         if (!r.available) {
-          return json({ error: '平台运行时未提供 node:dgram，UDP 不可用', addr, port }, 502);
+          return jsonXhttp({ error: '平台运行时未提供 node:dgram，UDP 不可用', addr, port }, 502);
         }
         if (!r.ok) {
-          return json(
+          return jsonXhttp(
             { error: 'UDP 已发送但无响应（可能被环境过滤）', addr, port, sent: r.sent, ms: r.ms, ...(r.error ? { relayError: r.error } : {}) },
             502
           );
@@ -238,7 +238,7 @@ export async function handleXhttp(context: any): Promise<Response> {
       if (p > 0) { port = p; addr = addr.slice(0, i); }
     }
     if (!addr || !port) {
-      return json({ error: '缺少 addr/port 参数', usage: 'POST /xhttp?addr=<host>&port=<n>  body=<上行字节>' }, 400);
+      return jsonXhttp({ error: '缺少 addr/port 参数', usage: 'POST /xhttp?addr=<host>&port=<n>  body=<上行字节>' }, 400);
     }
 
     const result = runTunnel(addr, port, uplink, 'raw', proxyIP);
@@ -252,6 +252,6 @@ export async function handleXhttp(context: any): Promise<Response> {
       },
     });
   } catch (err: any) {
-    return json({ error: err?.message || String(err) }, 500);
+    return jsonXhttp({ error: err?.message || String(err) }, 500);
   }
 }

@@ -15,7 +15,7 @@ import { readBodyBuffer, buildDnsQuery } from './_util.ts';
 const RESPONSE_QUIET_MS = 400;
 const EXCHANGE_TIMEOUT_MS = 5000;
 
-function json(obj: any, status = 200): Response {
+function jsonUdp(obj: any, status = 200): Response {
   return new Response(JSON.stringify(obj, null, 2), {
     status,
     headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store' },
@@ -145,7 +145,7 @@ export async function handleUdp(context: any): Promise<Response> {
   } catch { dgram = null; }
 
   if (!dgram || typeof dgram.createSocket !== 'function') {
-    return json({
+    return jsonUdp({
       dgramAvailable: false,
       note: '平台运行时未提供 node:dgram，UDP 路线不可行（Hysteria2/QUIC 亦不可行）',
     });
@@ -166,7 +166,7 @@ export async function handleUdp(context: any): Promise<Response> {
         if (r.ok) { probe = r; usedResolver = resolver; break; }
         probe = r;
       }
-      return json({
+      return jsonUdp({
         dgramAvailable: true,
         resolver: usedResolver || null,
         dnsProbe: {
@@ -187,15 +187,15 @@ export async function handleUdp(context: any): Promise<Response> {
 
     // 中继：POST/GET + host/port
     if (!host || !port) {
-      return json({ error: '缺少 host/port', usage: 'POST /udp?host=<ip>&port=<n>  body=<UDP 载荷>' }, 400);
+      return jsonUdp({ error: '缺少 host/port', usage: 'POST /udp?host=<ip>&port=<n>  body=<UDP 载荷>' }, 400);
     }
     const { buf, how } = await readBodyBuffer(request);
     if (!buf || !buf.length) {
-      return json({ error: '缺少 UDP 载荷（body 为空）', bodyHow: how }, 400);
+      return jsonUdp({ error: '缺少 UDP 载荷（body 为空）', bodyHow: how }, 400);
     }
     const r = await udpExchange(dgram, buf, host, port, EXCHANGE_TIMEOUT_MS);
     if (!r.ok) {
-      return json(
+      return jsonUdp(
         { sent: r.sent, ok: false, responses: 0, ms: r.ms, host, port, bodyHow: how, ...(r.error ? { error: r.error } : {}) },
         502
       );
@@ -211,6 +211,6 @@ export async function handleUdp(context: any): Promise<Response> {
       },
     });
   } catch (err: any) {
-    return json({ error: err?.message || String(err) }, 500);
+    return jsonUdp({ error: err?.message || String(err) }, 500);
   }
 }

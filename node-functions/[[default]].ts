@@ -1,48 +1,95 @@
-// EdgeOne Pages Node Functions —— HTTP 兜底路由（catch-all）
-// 注意：WebSocket 升级由 websocket.ts（/websocket）与 vless.ts（/vless）处理。
-// 本文件服务 HTTP 端点：
-//   - /debug        自诊断端点（DNS / 出站 TCP 探测 / 请求头回显）
-//   - /<UUID>       多节点配置文本
-//   - /xhttp /udp   兜底委托到 _xhttp-core / _udp-core（命名路由未生效时仍可用）
-//   - 其它          404（/ 静态首页优先）
+/* global WebSocketPair */
+// EdgeOne Pages Node Functions —— 唯一路由入口（catch-all）
 //
-// v14.3 修复：路由文件不得互相 import（本文件此前 import websocket.ts，
-// 平台合并打包时 onRequest 重复声明导致构建失败）。所有共享逻辑移入 _ 前缀内部模块。
+// v14.4：平台构建器把 node-functions/ 下所有 .ts 合并为单一包，onRequest 全目录
+// 只能有一个 —— 本文件是唯一的 onRequest。所有路由在此内部分发：
+//   - /vless /websocket /ws   WebSocket 升级（VLESS 隧道；内联字面量 return { websocket: ... }，
+//                             官方模板形态，WS 桥接静态分析依赖，勿改为中间变量）
+//   - /xhttp                  XHTTP 事务隧道（_xhttp-core.handleXhttp）
+//   - /udp                    UDP 探针 + 逐包中继（_udp-core.handleUdp）
+//   - /debug                  自诊断（DNS / TCP / 域名跟随 / WS 诊断）
+//   - /<UUID>                 多节点配置文本
+//   - /affinity /stream-*     平台能力探针
+//   - 其它                    404（/ 静态首页优先）
+//
+// 共享逻辑全部在 _ 前缀内部模块（官方约定：不生成路由，供 import 复用）。
 
 import dns from 'node:dns';
 import net from 'node:net';
 import { getFullConfig } from './_config.ts';
-import { getWsDiag } from './_vless-core.ts';
+import {
+  createVlessWebSocketHandler,
+  wirePairServer,
+  report,
+  configureAuth,
+  getWsDiag,
+} from './_vless-core.ts';
 import { handleXhttp } from './_xhttp-core.ts';
 import { handleUdp } from './_udp-core.ts';
 
-let userID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
-let proxyIP = '';
+// 命名注意：与 _vless-core 的 userID/proxyIP 错开（合并打包下避免任何顶层同名风险）
+let cfgUserID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
+let cfgProxyIP = '';
 
 // 实例亲和性探针：模块级计数器（跨请求存活 => 同一实例 => 有状态会话可行）
 let affinityCount = 0;
 const AFFINITY_BOOT = Math.random().toString(36).slice(2, 8);
 
+const WS_PATHS = new Set(['/vless', '/websocket', '/ws']);
+
 /**
+ * 唯一的 onRequest —— 全部路由在此分发。
  * @param {any} context EdgeOne Node Functions EventContext
  */
 export async function onRequest(context: any) {
   const { request, env } = context;
   try {
-    userID = env?.UUID || userID;
-    proxyIP = env?.PROXYIP || proxyIP;
+    cfgUserID = env?.UUID || cfgUserID;
+    cfgProxyIP = env?.PROXYIP || cfgProxyIP;
+    configureAuth(env?.UUID, env?.PROXYIP);
 
-    // 升级请求不应到达这里；明确拒绝，避免平台对 catch-all 的 WS 处理出现 500
+    const url = new URL(request.url);
     const upgradeHeader: any = request.headers.get('upgrade');
+
+    // ---- WebSocket 升级（/vless /websocket /ws）----
     if (upgradeHeader?.toLowerCase() === 'websocket') {
+      if (!WS_PATHS.has(url.pathname)) {
+        return new Response('Bad WebSocket path', { status: 400 });
+      }
+
+      const mode: string = url.searchParams.get('ws-mode') || env?.WS_MODE || 'handlers';
+      report('upgrade', `path=${url.pathname} mode=${mode} route=catch-all`);
+
+      // 模式 A：CF 风格 WebSocketPair（若运行时提供）
+      if (mode === 'pair' && typeof WebSocketPair !== 'undefined') {
+        const pair = new WebSocketPair();
+        wirePairServer(pair[1], request);
+        return new Response(null, {
+          status: 101,
+          webSocket: pair[0],
+          headers: { 'sec-websocket-protocol': request.headers.get('sec-websocket-protocol') || '' },
+        });
+      }
+
+      // 模式 B：官方 handlers 形态 —— 内联字面量，勿改中间变量
+      report('upgrade returning handlers literal');
+      return { websocket: createVlessWebSocketHandler(request) };
+    }
+
+    // 非 upgrade 请求打到 WS 路径 → 提示正确用法
+    if (WS_PATHS.has(url.pathname)) {
       return new Response(
-        `WebSocket endpoint is /vless. Use wss://<host>/vless?ed=2048\n`,
+        `WebSocket endpoint.\nUse wss://<host>/vless?ed=2048\nAnd fetch config at /${cfgUserID}\n`,
         { status: 426, headers: { 'Content-Type': 'text/plain;charset=utf-8' } }
       );
     }
 
-    const url = new URL(request.url);
+    // ---- HTTP 端点分发 ----
     switch (url.pathname) {
+      case '/xhttp':
+        return await handleXhttp(context);
+      case '/udp':
+        return await handleUdp(context);
       case '/affinity': {
         // 实例亲和性探针：连续访问时 count 递增且 boot 相同 => 有状态会话可行
         affinityCount++;
@@ -56,12 +103,6 @@ export async function onRequest(context: any) {
           headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
         });
       }
-      case '/xhttp':
-        // 兜底委托（命名路由 /xhttp 未生效时仍可用）
-        return await handleXhttp(context);
-      case '/udp':
-        // 兜底委托（命名路由 /udp 未生效时仍可用）
-        return await handleUdp(context);
       case '/debug': {
         // 自诊断端点：检查 DNS 与出站 TCP 是否可用
         const diag = await handleDebug();
@@ -79,9 +120,9 @@ export async function onRequest(context: any) {
           headers: { 'Content-Type': 'application/json;charset=utf-8' },
         });
       }
-      case `/${userID}`: {
+      case `/${cfgUserID}`: {
         const hostName = resolveHostName(request, env);
-        return new Response(getFullConfig(userID, hostName), {
+        return new Response(getFullConfig(cfgUserID, hostName), {
           status: 200,
           headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         });
@@ -148,9 +189,6 @@ export async function onRequest(context: any) {
  * 解析客户端配置应使用的域名。
  * 优先级：CUSTOM_DOMAIN 环境变量 > eo-pages-host（EdgeOne 平台保留的原始域名）
  *        > X-Forwarded-Host > url.hostname > Host 头。
- *
- * 背景：Pages 平台把请求转发给函数时，Host 头会被改写为内部回源地址，
- * 但平台会在 eo-pages-host 头中保留用户实际访问的域名。
  */
 function resolveHostName(request: any, env: any): string {
   // 1. 显式指定（自定义域名场景最可靠，推荐）
@@ -190,7 +228,7 @@ async function handleDebug() {
   const results: any = {
     node: process?.version || 'unknown',
     time: new Date().toISOString(),
-    env: { uuidSet: Boolean(userID), proxyipSet: Boolean(proxyIP) },
+    env: { uuidSet: Boolean(cfgUserID), proxyipSet: Boolean(cfgProxyIP) },
   };
 
   // DNS

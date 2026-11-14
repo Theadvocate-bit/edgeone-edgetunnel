@@ -124,7 +124,7 @@ export function getFullConfig(uid: string, host: string): string {
   const h2Note = getHysteria2FormatNote(host);
   return `
 ################################################################
-EdgeOne Pages 多节点配置 (v14.3)
+EdgeOne Pages 多节点配置 (v14.4)
 域名: ${host}
 UUID: ${uid}
 ################################################################
