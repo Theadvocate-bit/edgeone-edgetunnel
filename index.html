@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Edge Tunnel · EdgeOne Pages</title>
+<style>
+  :root {
+    --bg: #f6f7fb;
+    --card: #ffffff;
+    --text: #1f2430;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --border: #e5e7eb;
+    --code: #f3f4f6;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    max-width: 640px;
+    width: 100%;
+    padding: 40px;
+    box-shadow: 0 4px 24px rgba(0,0,0,.06);
+  }
+  h1 { font-size: 24px; margin-bottom: 4px; }
+  h1 .dot { color: var(--accent); }
+  .sub { color: var(--muted); font-size: 14px; margin-bottom: 28px; }
+  h2 { font-size: 15px; margin: 24px 0 10px; color: var(--accent); }
+  p, li { font-size: 14px; line-height: 1.8; color: var(--text); }
+  ul { padding-left: 20px; margin: 6px 0; }
+  code {
+    background: var(--code);
+    padding: 2px 6px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-family: ui-monospace, Consolas, monospace;
+    word-break: break-all;
+  }
+  .tip {
+    margin-top: 28px;
+    padding: 14px 16px;
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    border-radius: 10px;
+    font-size: 13px;
+    color: #1e40af;
+  }
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--muted);
+    margin-top: 24px;
+  }
+  .status .ok { width: 8px; height: 8px; border-radius: 50%; background: #10b981; display: inline-block; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Edge Tunnel<span class="dot">.</span>EdgeOne</h1>
+    <div class="sub">VLESS over WebSocket · 部署于腾讯云 EdgeOne Pages (Node Functions)</div>
+
+    <h2>节点路径</h2>
+    <p>WebSocket 端点：<code>wss://&lt;你的域名&gt;/vless?ed=2048</code></p>
+
+    <h2>获取客户端配置</h2>
+    <p>在浏览器访问 <code>https://&lt;你的域名&gt;/&lt;你的 UUID&gt;</code>，即可获取 v2ray / clash-meta 客户端配置。</p>
+
+    <h2>环境变量（Pages 控制台设置）</h2>
+    <ul>
+      <li><code>UUID</code>：鉴权用 UUID，不设置则使用内置默认值</li>
+      <li><code>PROXYIP</code>：出站重试的中转 IP（可选）</li>
+    </ul>
+
+    <h2>平台限制说明</h2>
+    <ul>
+      <li>UDP 仅支持 53 端口 DNS，通过 DoH 转发</li>
+      <li>单次函数调用最长 120 秒（Node Functions 限制），客户端会自动重连</li>
+      <li>仅支持 HTTP/1.1 WebSocket</li>
+    </ul>
+
+    <div class="tip">本项目仅供技术学习与协议验证使用，请遵守当地法律法规，勿用于非法用途。</div>
+
+    <div class="status"><span class="ok"></span> 服务运行中</div>
+  </div>
+</body>
+</html>

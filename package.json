@@ -1,0 +1,8 @@
+{
+  "name": "edgeone-edgetunnel",
+  "version": "1.0.0",
+  "private": true,
+  "description": "VLESS over WebSocket on EdgeOne Pages (Node Functions), adapted from Cloudflare Worker edgetunnel",
+  "license": "GPL-3.0",
+  "type": "module"
+}
