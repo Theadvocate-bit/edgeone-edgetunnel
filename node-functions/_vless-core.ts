@@ -1,5 +1,8 @@
-/* global WebSocketPair */
-// EdgeOne Pages Node Functions 版 edgetunnel —— WS 端点
+// 内部共享模块（_ 前缀 = 不生成路由，官方约定）：VLESS 核心 + WS 处理器工厂
+//
+// 由 websocket.ts（/websocket 路由）与 vless.ts（/vless 路由）共同引用。
+// 本文件不导出 onRequest —— 路由入口文件不得互相 import（平台合并打包时会
+// 产生重复的 onRequest 声明，v14.2 构建失败的根本原因）。
 //
 // 双模式升级（可经 ?ws-mode= 或环境变量 WS_MODE 选择）：
 //   - "handlers"（默认）：返回 { websocket: { onopen, onmessage, onclose, onerror } }
@@ -16,13 +19,12 @@ import net from 'node:net';
 let userID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
 let proxyIP = '';
 
-const WS_PATH = '/vless';
 const DIAG_TOPIC = 'eone-diag-244423673';
 const BOOT_ID = Math.random().toString(36).slice(2, 10);
 
 const wsDiag: string[] = [];
 
-function report(event: string, detail?: any) {
+export function report(event: string, detail?: any) {
   let d = '';
   if (detail !== undefined) {
     try { d = typeof detail === 'string' ? detail : JSON.stringify(detail); } catch { d = String(detail); }
@@ -44,11 +46,17 @@ export function getWsDiag(): string[] {
   return wsDiag;
 }
 
+/** 路由入口调用：注入环境变量中的 UUID / PROXYIP */
+export function configureAuth(uuid?: string, proxyIp?: string) {
+  if (uuid) userID = uuid;
+  if (proxyIp) proxyIP = proxyIp;
+}
+
 /**
  * 兼容读取请求头：onRequest 里 headers 是 Headers 实例（有 .get），
  * 但 WS 回调里平台传入的 request.headers 可能是普通对象（无 .get）。
  */
-function readHeader(req: any, name: string): string {
+export function readHeader(req: any, name: string): string {
   try {
     const h = req?.headers;
     if (!h) return '';
@@ -56,60 +64,6 @@ function readHeader(req: any, name: string): string {
     const v = h[name] ?? h[name.toLowerCase()] ?? h[name.replace(/\b\w/g, (c: string) => c.toUpperCase())];
     return v ? String(v) : '';
   } catch { return ''; }
-}
-
-/**
- * @param {any} context EdgeOne Node Functions EventContext
- */
-export async function handleWebsocketRequest(context: any) {
-  const { request, env } = context;
-  try {
-    userID = env?.UUID || userID;
-    proxyIP = env?.PROXYIP || proxyIP;
-
-    const upgradeHeader: any = request.headers.get('upgrade');
-    if (upgradeHeader?.toLowerCase() === 'websocket') {
-      const url = new URL(request.url);
-      if (url.pathname !== '/websocket' && url.pathname !== '/ws' && url.pathname !== '/vless') {
-        return new Response('Bad WebSocket path', { status: 400 });
-      }
-
-      const mode: string = url.searchParams.get('ws-mode') || env?.WS_MODE || 'handlers';
-      report('upgrade', `path=${url.pathname} mode=${mode} boot=${BOOT_ID}`);
-
-      // ---- 模式 A：CF 风格 WebSocketPair（若运行时提供）----
-      if (mode === 'pair') {
-        if (typeof WebSocketPair === 'undefined') {
-          report('pair mode requested but WebSocketPair undefined');
-          // 落回 handlers 模式
-        } else {
-          const pair = new WebSocketPair();
-          const server = pair[1];
-          wirePairServer(server, request);
-          return new Response(null, {
-            status: 101,
-            webSocket: pair[0],
-            headers: { 'sec-websocket-protocol': request.headers.get('sec-websocket-protocol') || '' },
-          });
-        }
-      }
-
-      // ---- 模式 B：官方 handlers 形态 ----
-      // 重要：必须保持与官方模板完全一致的"内联字面量 + 单一键"返回，
-      // 平台构建器靠静态分析 return { websocket: ... } 注入 WS 桥接——
-      // 中间变量/别名键可能破坏注入（v10 修复）。
-      report('upgrade returning handlers literal');
-      return { websocket: createVlessWebSocketHandler(request) };
-    }
-
-    return new Response(
-      `WebSocket endpoint.\nUse wss://<host>${WS_PATH}?ed=2048\nAnd fetch config at /${userID}\n`,
-      { status: 426, headers: { 'Content-Type': 'text/plain;charset=utf-8' } }
-    );
-  } catch (err: any) {
-    report('onRequest error', err?.message || err);
-    return new Response(String(err), { status: 500 });
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -299,10 +253,10 @@ function createVlessConnection(wsRef: { current: any }, request: any): VlessConn
 }
 
 // ---------------------------------------------------------------------------
-// 模式 B：官方 handlers 形态
+// 官方 handlers 形态处理器工厂
 // ---------------------------------------------------------------------------
 
-function createVlessWebSocketHandler(request: any) {
+export function createVlessWebSocketHandler(request: any) {
   const wsRef = { current: null as any };
   let conn: VlessConnection | null = null;
 
@@ -377,10 +331,10 @@ function createVlessWebSocketHandler(request: any) {
 }
 
 // ---------------------------------------------------------------------------
-// 模式 A：CF 风格 WebSocketPair
+// CF 风格 WebSocketPair（若运行时提供）
 // ---------------------------------------------------------------------------
 
-function wirePairServer(server: any, request: any) {
+export function wirePairServer(server: any, request: any) {
   const wsRef = { current: server };
   report('pair mode: wiring server socket', `keys=[${Object.keys(server || {}).join(',')}]`);
 
@@ -577,9 +531,3 @@ export function processVlessHeader(buf: Buffer, uid: string) {
     isUDP,
   };
 }
-
-/**
- * 生成 v2ray / clash-meta 客户端配置文本
- * v14 起配置生成迁移至 config.ts（多节点并存），此处保留导出以兼容旧调用。
- */
-export { getVLESSConfig } from './config.ts';

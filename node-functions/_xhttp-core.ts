@@ -18,8 +18,8 @@
 // 超时保护：连接 8s / 空闲 15s / 总时长 25s（平台 30s 墙钟内安全收尾）。
 
 import net from 'node:net';
-import { processVlessHeader } from './websocket.ts';
-import { readBodyBuffer, b64urlToBuffer } from './util.ts';
+import { processVlessHeader } from './_vless-core.ts';
+import { readBodyBuffer, b64urlToBuffer } from './_util.ts';
 
 const CONNECT_TIMEOUT = 8000;
 const IDLE_TIMEOUT = 15000;
@@ -140,10 +140,8 @@ function json(obj: any, status = 200): Response {
   });
 }
 
-/**
- * @param {any} context EdgeOne Node Functions EventContext
- */
-export async function handleXhttpRequest(context: any) {
+/** /xhttp 端点处理器（由 xhttp.ts 路由与 [[default]].ts 兜底调用） */
+export async function handleXhttp(context: any): Promise<Response> {
   const { request, env } = context;
   const proxyIP: string = env?.PROXYIP || '';
 
@@ -196,7 +194,7 @@ export async function handleXhttpRequest(context: any) {
 
       // VLESS UDP 命令（command=2）：复用已验证可用的 dgram 逐包中继
       if (parsed.isUDP) {
-        const { relayPacket } = await import('./udp.ts');
+        const { relayPacket } = await import('./_udp-core.ts');
         const r = await relayPacket(addr, port, payload);
         if (!r.available) {
           return json({ error: '平台运行时未提供 node:dgram，UDP 不可用', addr, port }, 502);

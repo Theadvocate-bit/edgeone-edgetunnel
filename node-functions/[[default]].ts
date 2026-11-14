@@ -1,16 +1,20 @@
 // EdgeOne Pages Node Functions —— HTTP 兜底路由（catch-all）
-// 注意：WebSocket 升级统一由 websocket.ts（官方形态文件名）处理。
-// 本文件只服务 HTTP 端点：
+// 注意：WebSocket 升级由 websocket.ts（/websocket）与 vless.ts（/vless）处理。
+// 本文件服务 HTTP 端点：
 //   - /debug        自诊断端点（DNS / 出站 TCP 探测 / 请求头回显）
-//   - /<UUID>       v2ray / clash-meta 配置文本
+//   - /<UUID>       多节点配置文本
+//   - /xhttp /udp   兜底委托到 _xhttp-core / _udp-core（命名路由未生效时仍可用）
 //   - 其它          404（/ 静态首页优先）
+//
+// v14.3 修复：路由文件不得互相 import（本文件此前 import websocket.ts，
+// 平台合并打包时 onRequest 重复声明导致构建失败）。所有共享逻辑移入 _ 前缀内部模块。
 
 import dns from 'node:dns';
 import net from 'node:net';
-import { getFullConfig } from './config.ts';
-import { getWsDiag } from './websocket.ts';
-import { handleUdpRequest } from './udp.ts';
-import { handleXhttpRequest } from './xhttp.ts';
+import { getFullConfig } from './_config.ts';
+import { getWsDiag } from './_vless-core.ts';
+import { handleXhttp } from './_xhttp-core.ts';
+import { handleUdp } from './_udp-core.ts';
 
 let userID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
 let proxyIP = '';
@@ -52,6 +56,12 @@ export async function onRequest(context: any) {
           headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
         });
       }
+      case '/xhttp':
+        // 兜底委托（命名路由 /xhttp 未生效时仍可用）
+        return await handleXhttp(context);
+      case '/udp':
+        // 兜底委托（命名路由 /udp 未生效时仍可用）
+        return await handleUdp(context);
       case '/debug': {
         // 自诊断端点：检查 DNS 与出站 TCP 是否可用
         const diag = await handleDebug();
@@ -121,13 +131,6 @@ export async function onRequest(context: any) {
         });
       }
       default: {
-        // /udp/* 与 /xhttp/* 前缀交由各自模块处理器（重命名以避免多 onRequest 符号冲突）
-        if (url.pathname === '/udp' || url.pathname.startsWith('/udp/')) {
-          return await handleUdpRequest(context);
-        }
-        if (url.pathname === '/xhttp' || url.pathname.startsWith('/xhttp/')) {
-          return await handleXhttpRequest(context);
-        }
         // `/` 静态首页优先；这里兜底其它未匹配路径
         return new Response('Not found', { status: 404 });
       }

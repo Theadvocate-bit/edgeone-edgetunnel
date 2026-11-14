@@ -12,6 +12,7 @@ mkdirSync(tmpDir, { recursive: true });
 // 1. esbuild 打包（与平台构建器行为一致）
 for (const [entry, out] of [
   ['websocket.ts', 'websocket.mjs'],
+  ['vless.ts', 'vless.mjs'],
   ['[[default]].ts', 'default.mjs'],
   ['xhttp.ts', 'xhttp.mjs'],
   ['udp.ts', 'udp.mjs'],
@@ -27,6 +28,7 @@ for (const [entry, out] of [
 }
 
 const { onRequest: vlessOnRequest } = await import(pathToFileURL(path.join(tmpDir, 'websocket.mjs')).href);
+const { onRequest: vlessRouteOnRequest } = await import(pathToFileURL(path.join(tmpDir, 'vless.mjs')).href);
 const { onRequest: defaultOnRequest } = await import(pathToFileURL(path.join(tmpDir, 'default.mjs')).href);
 const { onRequest: xhttpOnRequest } = await import(pathToFileURL(path.join(tmpDir, 'xhttp.mjs')).href);
 const { onRequest: udpOnRequest } = await import(pathToFileURL(path.join(tmpDir, 'udp.mjs')).href);
@@ -82,8 +84,8 @@ function buildVlessRequest(host, port, payload, addrType = 2, command = 1) {
   return Buffer.concat([head, Buffer.from([0x01]), Buffer.from(host.split('.').map(Number)), Buffer.from(payload)]);
 }
 
-async function testWsUpgrade(label, request, sendFirstMessage) {
-  const result = await vlessOnRequest({ request, env: {}, waitUntil: () => {} });
+async function testWsUpgrade(label, request, sendFirstMessage, handler = vlessOnRequest) {
+  const result = await handler({ request, env: {}, waitUntil: () => {} });
   if (!result || !result.websocket) {
     console.log(`[${label}] FAIL ❌  (未返回 { websocket: handlers })`);
     return false;
@@ -120,6 +122,13 @@ async function main() {
     const buf = buildVlessRequest('example.com', 80,
       'GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n');
     allOk = (await testWsUpgrade('ws /vless normal', request, buf)) && allOk;
+    // v14.3：vless.ts 瘦路由（/vless 命名路由）独立验证
+    {
+      const req2 = new Request('https://test.edgeone.app/vless?ed=2048', {
+        headers: { upgrade: 'websocket', 'sec-websocket-protocol': '' },
+      });
+      allOk = (await testWsUpgrade('ws /vless vless.ts-route', req2, buf, vlessRouteOnRequest)) && allOk;
+    }
   }
 
   // --- 3. /ws 路径 + IPv4 地址类型 ---

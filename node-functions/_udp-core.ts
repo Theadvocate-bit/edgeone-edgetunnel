@@ -1,4 +1,4 @@
-// EdgeOne Pages Node Functions —— UDP 路线探针 + 逐包中继（v14）
+// 内部共享模块（_ 前缀 = 不生成路由）：UDP 路线探针 + 逐包中继
 //
 // 平台约束下的 UDP 能力验证与利用：
 //   1. GET /udp          —— 探测运行时是否提供 node:dgram，并实测 UDP 出站（向 8.8.8.8:53 发 DNS 查询）
@@ -7,8 +7,10 @@
 // Hysteria2 说明：Hysteria2 需要 QUIC 服务端（持久 UDP socket + QUIC 协议栈 + 连接级状态）。
 // 本平台沙箱逐请求重建、无跨请求状态、无 QUIC 运行时 —— 无法承载 Hysteria2 服务端。
 // UDP 路线的可用形态是本端点的「逐包无状态中继」，适用于 DNS 等一问一答型 UDP 流量。
+//
+// 本文件不导出 onRequest —— 由 udp.ts（/udp 路由）与 [[default]].ts 兜底引用。
 
-import { readBodyBuffer, buildDnsQuery } from './util.ts';
+import { readBodyBuffer, buildDnsQuery } from './_util.ts';
 
 const RESPONSE_QUIET_MS = 400;
 const EXCHANGE_TIMEOUT_MS = 5000;
@@ -131,10 +133,8 @@ export async function relayPacket(
   };
 }
 
-/**
- * @param {any} context EdgeOne Node Functions EventContext
- */
-export async function handleUdpRequest(context: any) {
+/** /udp 端点处理器（由 udp.ts 与 [[default]].ts 调用） */
+export async function handleUdp(context: any): Promise<Response> {
   const { request } = context;
 
   // 动态导入：平台运行时可能不提供 dgram（不能在模块顶层 import，否则整函数加载失败）
