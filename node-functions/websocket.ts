@@ -95,13 +95,11 @@ export async function onRequest(context: any) {
       }
 
       // ---- 模式 B：官方 handlers 形态 ----
-      const handlers = createVlessWebSocketHandler(request);
-      return {
-        websocket: handlers,
-        webSocket: handlers,
-        socket: handlers,
-        ws: handlers,
-      };
+      // 重要：必须保持与官方模板完全一致的"内联字面量 + 单一键"返回，
+      // 平台构建器靠静态分析 return { websocket: ... } 注入 WS 桥接——
+      // 中间变量/别名键可能破坏注入（v10 修复）。
+      report('upgrade returning handlers literal');
+      return { websocket: createVlessWebSocketHandler(request) };
     }
 
     return new Response(
