@@ -1,6 +1,6 @@
 // 冒烟测试：模拟 EdgeOne Node Functions 官方 WS API（返回 { websocket: {onopen,onmessage,onclose,onerror} }），
 // 验证 VLESS over WS -> net TCP 全链路
-import { onRequest } from '../node-functions/[[default]].js';
+import { onRequest } from '../node-functions/[[default]].ts';
 
 class MockWS {
   constructor() {
