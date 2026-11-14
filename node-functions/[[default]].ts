@@ -56,6 +56,48 @@ export async function onRequest(context: any) {
           headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         });
       }
+      case '/stream-out': {
+        // 流式响应能力探针：每 500ms 发一块，共 6 块（3 秒）
+        const stream = new ReadableStream({
+          start(controller) {
+            const enc = new TextEncoder();
+            let i = 0;
+            const t = setInterval(() => {
+              i++;
+              try {
+                controller.enqueue(enc.encode(`chunk ${i} @${Date.now()}\n`));
+                if (i >= 6) { clearInterval(t); controller.close(); }
+              } catch { clearInterval(t); }
+            }, 500);
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { 'Content-Type': 'text/plain', 'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store' },
+        });
+      }
+      case '/stream-in': {
+        // 流式请求体能力探针：读 POST body 的每个 chunk 并记录到达时间
+        const chunks: number[] = [];
+        const times: number[] = [];
+        const start = Date.now();
+        const reader = (request.body as any)?.getReader?.();
+        if (!reader) {
+          return new Response(JSON.stringify({ error: 'no request.body stream' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        let bytes = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          bytes += value?.byteLength || 0;
+          chunks.push(value?.byteLength || 0);
+          times.push(Date.now() - start);
+        }
+        return new Response(JSON.stringify({ chunks, times, bytes, totalMs: Date.now() - start }, null, 2), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
       default: {
         // `/` 静态首页优先；这里兜底其它未匹配路径
         return new Response('Not found', { status: 404 });
