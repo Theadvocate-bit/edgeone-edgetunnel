@@ -134,7 +134,7 @@ export async function relayPacket(
 /**
  * @param {any} context EdgeOne Node Functions EventContext
  */
-export async function onRequest(context: any) {
+export async function handleUdpRequest(context: any) {
   const { request } = context;
 
   // 动态导入：平台运行时可能不提供 dgram（不能在模块顶层 import，否则整函数加载失败）

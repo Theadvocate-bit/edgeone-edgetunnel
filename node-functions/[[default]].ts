@@ -9,6 +9,8 @@ import dns from 'node:dns';
 import net from 'node:net';
 import { getFullConfig } from './config.ts';
 import { getWsDiag } from './websocket.ts';
+import { handleUdpRequest } from './udp.ts';
+import { handleXhttpRequest } from './xhttp.ts';
 
 let userID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
 let proxyIP = '';
@@ -119,6 +121,13 @@ export async function onRequest(context: any) {
         });
       }
       default: {
+        // /udp/* 与 /xhttp/* 前缀交由各自模块处理器（重命名以避免多 onRequest 符号冲突）
+        if (url.pathname === '/udp' || url.pathname.startsWith('/udp/')) {
+          return await handleUdpRequest(context);
+        }
+        if (url.pathname === '/xhttp' || url.pathname.startsWith('/xhttp/')) {
+          return await handleXhttpRequest(context);
+        }
         // `/` 静态首页优先；这里兜底其它未匹配路径
         return new Response('Not found', { status: 404 });
       }

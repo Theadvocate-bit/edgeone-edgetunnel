@@ -143,7 +143,7 @@ function json(obj: any, status = 200): Response {
 /**
  * @param {any} context EdgeOne Node Functions EventContext
  */
-export async function onRequest(context: any) {
+export async function handleXhttpRequest(context: any) {
   const { request, env } = context;
   const proxyIP: string = env?.PROXYIP || '';
 

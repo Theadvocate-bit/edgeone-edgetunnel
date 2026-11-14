@@ -61,7 +61,7 @@ function readHeader(req: any, name: string): string {
 /**
  * @param {any} context EdgeOne Node Functions EventContext
  */
-export async function onRequest(context: any) {
+export async function handleWebsocketRequest(context: any) {
   const { request, env } = context;
   try {
     userID = env?.UUID || userID;
