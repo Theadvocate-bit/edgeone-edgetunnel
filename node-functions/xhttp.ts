@@ -113,12 +113,17 @@ export async function handleXhttp(context: any): Promise<Response | null> {
   if (method === 'POST') {
     try { sweep(); } catch { /* ignore */ }
     const raw = await request.arrayBuffer();
+    const preExisting = !!getSession(id);
     await handleUpload(id, Buffer.from(raw));
+    const s = getSession(id);
+    report(`POST id=${id.slice(0,8)} preExisting=${preExisting} bytes=${raw.length} socket=${!!s?.socket} established=${s?.established} sessionsInMap=${sessions.size}`);
     return new Response(null, { status: 200, headers: { 'Cache-Control': 'no-store' } });
   }
 
   if (method === 'GET') {
+    const existing = getSession(id);
     const s = ensureSession(id);
+    report(`GET id=${id.slice(0,8)} preExisting=${!!existing} socket=${!!s.socket} buffered=${s.buffer.length} ended=${s.ended} sessionsInMap=${sessions.size}`);
     const since = parseInt(url.searchParams.get('seq') || '0', 10) || 0;
     const started = Date.now();
     let cursor = since;          // 已下发的累计字节序号
@@ -147,6 +152,12 @@ export async function handleXhttp(context: any): Promise<Response | null> {
       'Content-Type': 'application/octet-stream',
       'X-Accel-Buffering': 'no',
       'Cache-Control': 'no-store',
+      // 临时隔离诊断：GET 落到的 isolate 是否能看到 POST 创建的会话/socket
+      'X-DBG-Pre': existing ? '1' : '0',
+      'X-DBG-Socket': s.socket ? '1' : '0',
+      'X-DBG-Buf': String(s.buffer.length),
+      'X-DBG-Ended': s.ended ? '1' : '0',
+      'X-DBG-Sessions': String(sessions.size),
     };
     if (s.error) headers['X-XHTTP-Error'] = s.error;
     void cursor;
