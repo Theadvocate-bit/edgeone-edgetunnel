@@ -1,10 +1,33 @@
-// 冒烟测试（node --experimental-strip-types 运行）：
-// 1. vless.ts：模拟 EdgeOne 官方 WS API（升级返回 { websocket: {onopen,onmessage,...} }），
-//    验证 VLESS over WS -> net TCP 全链路（普通 + early data 两种路径）
-// 2. [[default]].ts：验证 /debug 与 /<UUID> HTTP 端点
-import { onRequest as vlessOnRequest } from '../node-functions/vless.ts';
-import { onRequest as defaultOnRequest } from '../node-functions/[[default]].ts';
+// 冒烟测试：先 esbuild 打包 node-functions/*.ts 到 .tmp/，再模拟 EdgeOne 运行时验证。
+// 运行：node test/run.mjs
+import { mkdirSync } from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { build } from 'esbuild';
 
+const root = path.resolve(new URL('..', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+const tmpDir = path.join(root, '.tmp');
+mkdirSync(tmpDir, { recursive: true });
+
+// 1. esbuild 打包（与平台构建器行为一致）
+for (const [entry, out] of [
+  ['websocket.ts', 'websocket.mjs'],
+  ['[[default]].ts', 'default.mjs'],
+]) {
+  await build({
+    entryPoints: [path.join(root, 'node-functions', entry)],
+    bundle: true,
+    platform: 'node',
+    format: 'esm',
+    outfile: path.join(tmpDir, out),
+    logLevel: 'warning',
+  });
+}
+
+const { onRequest: vlessOnRequest } = await import(pathToFileURL(path.join(tmpDir, 'websocket.mjs')).href);
+const { onRequest: defaultOnRequest } = await import(pathToFileURL(path.join(tmpDir, 'default.mjs')).href);
+
+// 2. 测试逻辑
 class MockWS {
   constructor() {
     this.sent = [];
@@ -15,22 +38,20 @@ class MockWS {
   close() { this.readyState = 3; this.closed = true; }
 }
 
-// 构造 VLESS 请求头: version + uuid(16) + optLen + command + port(2) + addrType + addr + payload
 function buildVlessRequest(host, port, payload, addrType = 2) {
   const uuidStr = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
   const uuid = Buffer.from(uuidStr.replace(/-/g, ''), 'hex');
   const head = Buffer.concat([
-    Buffer.from([0x00]),                 // version
-    uuid,                                // 16 bytes uuid
-    Buffer.from([0x00]),                 // opt length = 0
-    Buffer.from([0x01]),                 // command: TCP
-    Buffer.from([(port >> 8) & 0xff, port & 0xff]), // port big-endian
+    Buffer.from([0x00]),
+    uuid,
+    Buffer.from([0x00]),
+    Buffer.from([0x01]),
+    Buffer.from([(port >> 8) & 0xff, port & 0xff]),
   ]);
   if (addrType === 2) {
     const hostBuf = Buffer.from(host);
     return Buffer.concat([head, Buffer.from([0x02, hostBuf.length]), hostBuf, Buffer.from(payload)]);
   }
-  // addrType=1 ipv4（地址类型 1 字节 + 4 字节 IP，无长度前缀）
   return Buffer.concat([head, Buffer.from([0x01]), Buffer.from(host.split('.').map(Number)), Buffer.from(payload)]);
 }
 
@@ -53,49 +74,60 @@ async function testWsUpgrade(label, request, sendFirstMessage) {
 async function main() {
   let allOk = true;
 
-  // --- 1. 普通 WS 路径：首消息带 VLESS 头 ---
+  // --- 1. /websocket 路径 + early data ---
+  {
+    const buf = buildVlessRequest('example.com', 80,
+      'GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n');
+    const b64 = buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const request = new Request('https://test.edgeone.app/websocket?ed=2048', {
+      headers: { upgrade: 'websocket', 'sec-websocket-protocol': b64 },
+    });
+    allOk = (await testWsUpgrade('ws /websocket early-data', request, null)) && allOk;
+  }
+
+  // --- 2. /vless 兼容路径：首消息带 VLESS 头 ---
   {
     const request = new Request('https://test.edgeone.app/vless?ed=2048', {
       headers: { upgrade: 'websocket', 'sec-websocket-protocol': '' },
     });
     const buf = buildVlessRequest('example.com', 80,
       'GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n');
-    allOk = (await testWsUpgrade('ws-normal', request, buf)) && allOk;
+    allOk = (await testWsUpgrade('ws /vless normal', request, buf)) && allOk;
   }
 
-  // --- 2. ed=2048 early data：VLESS 首包经 base64url 放进 sec-websocket-protocol ---
+  // --- 3. /ws 路径 + IPv4 地址类型 ---
   {
-    const buf = buildVlessRequest('example.com', 80,
-      'GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n');
-    const b64 = buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-    const request = new Request('https://test.edgeone.app/vless?ed=2048', {
-      headers: { upgrade: 'websocket', 'sec-websocket-protocol': b64 },
-    });
-    allOk = (await testWsUpgrade('ws-early-data', request, null)) && allOk;
-  }
-
-  // --- 3. IPv4 地址类型 ---
-  {
-    const request = new Request('https://test.edgeone.app/vless', {
+    const request = new Request('https://test.edgeone.app/ws', {
       headers: { upgrade: 'websocket' },
     });
     const buf = buildVlessRequest('1.1.1.1', 80,
       'GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n', 1);
-    allOk = (await testWsUpgrade('ws-ipv4', request, buf)) && allOk;
+    allOk = (await testWsUpgrade('ws /ws ipv4', request, buf)) && allOk;
   }
 
-  // --- 4. [[default]].ts：/debug 端点 ---
+  // --- 4. 非法路径拒绝 400 ---
+  {
+    const request = new Request('https://test.edgeone.app/other', {
+      headers: { upgrade: 'websocket' },
+    });
+    const resp = await vlessOnRequest({ request, env: {}, waitUntil: () => {} });
+    const ok = resp instanceof Response && resp.status === 400;
+    console.log(`[ws bad-path] status=${resp?.status} -> ${ok ? 'PASS ✅' : 'FAIL ❌'}`);
+    allOk = allOk && ok;
+  }
+
+  // --- 5. [[default]].ts：/debug 端点 ---
   {
     const resp = await defaultOnRequest({
       request: new Request('https://t.app/debug'),
       env: {},
     });
     const data = await resp.json();
-    console.log('[/debug]', JSON.stringify(data));
+    console.log('[/debug]', JSON.stringify({ dns: data.dns, resolvedHost: data.resolvedHost, headers: Object.keys(data.forwardedHeaders || {}) }));
     if (!data.dns || data.dns.status !== 'ok') allOk = false;
   }
 
-  // --- 5. [[default]].ts：/<UUID> 配置页 + 升级拒绝 ---
+  // --- 6. 配置页 + 升级拒绝 ---
   {
     const uuid = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
     const resp = await defaultOnRequest({
@@ -115,30 +147,26 @@ async function main() {
     allOk = allOk && resp2.status === 426;
   }
 
-  // --- 6. 自定义域名跟随：Host 被平台改写时的域名解析链 ---
+  // --- 7. 自定义域名跟随 ---
   {
     const uuid = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
     const checkHost = async (label, req, env, expect) => {
       const t = await (await defaultOnRequest({ request: req, env })).text();
-      // vlessMain 里 address/sni/host 都用同一 hostName
       const ok = t.includes(`@${expect}:443`) && t.includes(`sni=${expect}`);
       console.log(`[custom-host:${label}] ${ok ? 'PASS ✅' : 'FAIL ❌'} (期望 ${expect})`);
       return ok;
     };
 
-    // a. Host 被改写为内部地址，但 X-Forwarded-Host 保留自定义域名
     allOk = await checkHost('x-forwarded-host',
       new Request(`https://internal.edgeone.internal/${uuid}`, {
         headers: { host: 'internal.edgeone.internal', 'x-forwarded-host': 'my.domain.com' },
       }), {}, 'my.domain.com') && allOk;
 
-    // b. 设置 CUSTOM_DOMAIN 环境变量后强制生效（最高优先级）
     allOk = await checkHost('custom-domain-env',
       new Request(`https://whatever.example.com/${uuid}`, {
         headers: { host: 'whatever.example.com', 'x-forwarded-host': 'ignored.com' },
       }), { CUSTOM_DOMAIN: 'my.custom.domain' }, 'my.custom.domain') && allOk;
 
-    // c. 无转发头时回退到 url.hostname（而非被改写的 Host 头）
     allOk = await checkHost('url-hostname-fallback',
       new Request(`https://site.edgeone.app/${uuid}`, {
         headers: { host: 'rewritten.internal' },

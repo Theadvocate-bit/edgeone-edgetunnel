@@ -1,14 +1,13 @@
 // EdgeOne Pages Node Functions —— HTTP 兜底路由（catch-all）
-// 注意：WebSocket 升级已移至具名路由 vless.ts（/vless）。
-// 平台的 WS 桥接疑似不覆盖 [[default]] catch-all 路由（升级请求在 101 前被平台打成 500），
-// 因此本文件刻意不处理任何 WebSocket 升级，只服务 HTTP 端点：
-//   - /debug        自诊断端点（DNS / 出站 TCP 探测）
+// 注意：WebSocket 升级统一由 websocket.ts（官方形态文件名）处理。
+// 本文件只服务 HTTP 端点：
+//   - /debug        自诊断端点（DNS / 出站 TCP 探测 / 请求头回显）
 //   - /<UUID>       v2ray / clash-meta 配置文本
 //   - 其它          404（/ 静态首页优先）
 
 import dns from 'node:dns';
 import net from 'node:net';
-import { getVLESSConfig } from './vless.ts';
+import { getVLESSConfig } from './websocket.ts';
 
 let userID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
 let proxyIP = '';
@@ -37,6 +36,13 @@ export async function onRequest(context: any) {
         // 自诊断端点：检查 DNS 与出站 TCP 是否可用
         const diag = await handleDebug();
         diag.resolvedHost = resolveHostName(request, env); // 供确认配置生成所用的域名
+        diag.requestUrl = request.url;
+        // 回显平台转发时保留的头（用于诊断自定义域名跟随）
+        const fwdHeaders: Record<string, string> = {};
+        (request.headers as any).forEach?.((v: string, k: string) => {
+          if (/host|forward|origin|referer|x-real|eo-/i.test(k)) fwdHeaders[k] = v;
+        });
+        diag.forwardedHeaders = fwdHeaders;
         return new Response(JSON.stringify(diag, null, 2), {
           status: 200,
           headers: { 'Content-Type': 'application/json;charset=utf-8' },

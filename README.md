@@ -8,10 +8,10 @@
 |---|---|
 | `import { connect } from 'cloudflare:sockets'` | Node.js `net.connect`（事件驱动桥接 WS 回调，带 8 秒连接超时） |
 | `WebSocketPair`（CF 专有） | **EdgeOne 官方 WS API**：handler 对升级请求返回 `{ websocket: { onopen, onmessage, onclose, onerror } }`，平台负责 101 握手并回调事件。⚠️ 运行时不存在 `WebSocketPair`，使用会导致升级 500 |
-| WS 处理在 fetch 入口 | **具名路由 + TS 文件**：`node-functions/vless.ts`（路由 `/vless`），复刻官方 WS 模板形态——平台的 WS 桥接疑似不覆盖 `[[default]]` catch-all 路由 |
+| WS 处理在 fetch 入口 | **官方同形态文件**：`node-functions/websocket.ts`（文件名与官方 WS 模板一致，平台的 WS 桥接按此文件名挂接）。`package.json` 同步对齐官方：`"type": "commonjs"` + 依赖 `ws` |
 | `env.UUID` / `env.PROXYIP` | `context.env.UUID` / `context.env.PROXYIP`（Pages 控制台环境变量） |
 | `request.cf`（CF 请求指纹） | 已移除，首页改为静态说明页 |
-| WS 路径 `/?ed=2048` | **`/vless?ed=2048`** |
+| WS 路径 `/?ed=2048` | **`/vless?ed=2048`**（`websocket.ts` 同时接受 `/websocket`、`/ws`、`/vless` 三个路径） |
 | 流式 pipeTo 管道 | 事件驱动：`onmessage` → 解析/转发；socket `data` → `ws.send`（首包拼 VLESS 响应头） |
 | UDP DNS（CF 无 UDP 出站） | 同样通过 DoH（`https://1.1.1.1/dns-query`）转发，含长度前缀重组缓冲 |
 | — | **`/debug` 自诊断端点**：实测 DNS 与出站 TCP 连通性 |
@@ -20,11 +20,12 @@
 
 ```
 ├── index.html                    # 静态首页（说明页）
-├── package.json
+├── package.json                  # "type": "commonjs" + 依赖 ws（与官方 WS 模板一致）
 ├── test/
-│   └── smoke-test.mjs            # 本地冒烟测试（5 项用例）
+│   └── run.mjs                   # 本地冒烟测试（esbuild 打包后模拟运行时，9 项用例）
 └── node-functions/
-    ├── vless.ts                  # WS 端点（具名路由 /vless）+ VLESS 核心 + 配置生成
+    ├── websocket.ts              # WS 端点（官方形态文件名）+ VLESS 核心 + 配置生成
+    ├── vless.ts                  # 兼容路由：转发到 websocket.ts（/vless 路径）
     └── [[default]].ts            # HTTP 兜底：/debug、/<UUID>、404（不处理 WS 升级）
 ```
 
@@ -81,9 +82,10 @@ edgeone pages deploy # 部署
 ## 本地验证
 
 ```bash
-node --experimental-strip-types test/smoke-test.mjs
-# 5 项用例：普通 WS 路径 / ed=2048 early data / IPv4 地址类型 /
-#          /debug 端点 / 配置页与 catch-all 升级拒绝
+npm install
+node test/run.mjs
+# 9 项用例：/websocket early data / /vless 普通 / /ws IPv4 / 非法路径 400 /
+#          /debug / 配置页 / catch-all 升级拒绝 / 自定义域名跟随 ×3
 # WS 用例验证：升级返回 { websocket: handlers } -> VLESS 头解析 -> net TCP 连接
 #             -> 回传数据首 2 字节为 VLESS 响应头 0x00 0x00，后接 HTTP 响应
 ```
@@ -91,10 +93,12 @@ node --experimental-strip-types test/smoke-test.mjs
 ## 排障记录
 
 - **WS 升级 500**：根因是在升级请求中使用了 `WebSocketPair`（该 API 在 EdgeOne Node Functions 运行时不存在，属于 Cloudflare 写法）。正确方式是返回 `{ websocket: { onopen, onmessage, onclose, onerror } }`，由平台完成 101 握手。已与官方 `TencentEdgeOne/pages-ai-voice-chat` 模板逐行核对：API 形状、回调签名、`ws.send(Buffer)` 数据类型均一致。
-- **WS 桥接未建立（平台层面 500，101 握手前被打断）**：官方确认平台未给项目接上 WebSocket 桥接。对策：把 WS 处理从 `[[default]]` catch-all 路由移到**具名路由 TS 文件** `vless.ts`（官方所有 WS 模板均为「具名路由 + .ts」形态）。若具名路由仍 500：
-  1. 在 Pages 控制台改动任意文件触发重新构建（桥接随构建产物注入）；
-  2. 应急方案：将 `vless.ts` 重命名为 `websocket.ts` 并同步修改客户端 path（文件名与官方模板完全一致）；
-  3. 向 EdgeOne 官方反馈（其已确认桥接缺失属平台问题）。
+- **WS 桥接未建立（平台层面 500，101 握手前被打断）**：官方确认平台未给项目接上 WebSocket 桥接。对策（本轮已全部落实）：
+  1. WS 处理移入**官方同形态文件** `websocket.ts`（官方代码同时接受 `/websocket` 与 `/ws`，说明平台把升级请求统一路由到该文件名）；
+  2. `package.json` 对齐官方：`"type": "commonjs"` + `dependencies.ws`（构建产物形态一致性）；
+  3. 保留 `vless.ts` 兼容路由，`/vless` 路径同样可用；
+  4. `/debug` 端点新增 `forwardedHeaders` 回显，辅助诊断平台转发行为。
+  若重新部署后仍 500，向 EdgeOne 官方反馈（其已确认桥接缺失属平台问题），并索要已验证可用的最小 WS 示例。
 - **回传数据缺 VLESS 响应头**：客户端无法识别首包。需在 TCP 出站首次收到数据时拼接 `[version, 0x00]` 两字节（DNS 路径同理）。
 - **连接不上**：按以下顺序排查
   1. **访问 `https://<你的域名>/debug`**——自诊断端点会实测 DNS 解析和 3 个目标的出站 TCP（带 5 秒超时）。若全部 timeout/error，说明 EdgeOne 节点出站被限制，此平台无法承载该用途；
