@@ -306,13 +306,38 @@ function createVlessWebSocketHandler(request: any) {
   const wsRef = { current: null as any };
   let conn: VlessConnection | null = null;
 
+  /**
+   * 关键诊断/修复：平台的 ws 对象 readyState 可能卡在 CONNECTING(0)。
+   * ws 包的 send() 在非 OPEN 状态会静默丢弃数据并触发无人监听的 error 事件，
+   * close() 则不发 close 帧直接断 TCP——与线上全部现象吻合。
+   * 若不是 OPEN，强制置 1 并补发 open 事件。
+   */
+  function ensureOpen(ws: any): boolean {
+    if (!ws) return false;
+    try {
+      ws.on?.('error', (e: any) => report('ws emitted error', e?.message || String(e)));
+    } catch { /* ignore */ }
+    if (ws.readyState === 1 || ws.readyState === 'open') return true;
+    report('readyState NOT open', `readyState=${ws.readyState}, ctor=${ws?.constructor?.name}, sockCtor=${ws?._socket?.constructor?.name}, sendSrc=${String(ws?.send).slice(0, 80)}`);
+    try {
+      ws.readyState = 1;
+      ws.emit?.('open');
+      report('forced readyState=OPEN');
+      return true;
+    } catch (err: any) {
+      report('force open failed', err?.message || err);
+      return false;
+    }
+  }
+
   return {
     async onopen(ws: any, req: any) {
       wsRef.current = ws;
-      report('onopen', `keys=[${Object.keys(ws || {}).slice(0, 8).join(',')}], send=${typeof ws?.send}, headersType=${req?.headers?.constructor?.name || typeof req?.headers}`);
+      ensureOpen(ws);
+      report('onopen', `readyState=${ws?.readyState} send=${typeof ws?.send} headersType=${req?.headers?.constructor?.name || typeof req?.headers}`);
       try {
         ws.send('ready');
-        report("onopen sent 'ready'");
+        report("onopen sent 'ready'", `bufferedAmount=${ws?.bufferedAmount}`);
         conn = createVlessConnection(wsRef, req || request);
         conn.handleEarlyData();
       } catch (err: any) {
@@ -324,8 +349,9 @@ function createVlessWebSocketHandler(request: any) {
 
     async onmessage(ws: any, message: any, isBinary: boolean) {
       wsRef.current = ws;
+      ensureOpen(ws);
       try {
-        report('onmessage', `len=${message?.byteLength ?? message?.length ?? '?'} binary=${isBinary}`);
+        report('onmessage', `len=${message?.byteLength ?? message?.length ?? '?'} binary=${isBinary} readyState=${ws?.readyState}`);
         const chunk = toBuffer(message, isBinary);
         if (!chunk) return;
         if (!conn) conn = createVlessConnection(wsRef, request);
