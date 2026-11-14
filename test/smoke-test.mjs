@@ -1,6 +1,9 @@
-// 冒烟测试：模拟 EdgeOne Node Functions 官方 WS API（返回 { websocket: {onopen,onmessage,onclose,onerror} }），
-// 验证 VLESS over WS -> net TCP 全链路
-import { onRequest } from '../node-functions/[[default]].ts';
+// 冒烟测试（node --experimental-strip-types 运行）：
+// 1. vless.ts：模拟 EdgeOne 官方 WS API（升级返回 { websocket: {onopen,onmessage,...} }），
+//    验证 VLESS over WS -> net TCP 全链路（普通 + early data 两种路径）
+// 2. [[default]].ts：验证 /debug 与 /<UUID> HTTP 端点
+import { onRequest as vlessOnRequest } from '../node-functions/vless.ts';
+import { onRequest as defaultOnRequest } from '../node-functions/[[default]].ts';
 
 class MockWS {
   constructor() {
@@ -13,55 +16,107 @@ class MockWS {
 }
 
 // 构造 VLESS 请求头: version + uuid(16) + optLen + command + port(2) + addrType + addr + payload
-function buildVlessRequest(host, port, payload) {
+function buildVlessRequest(host, port, payload, addrType = 2) {
   const uuidStr = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
   const uuid = Buffer.from(uuidStr.replace(/-/g, ''), 'hex');
-  const hostBuf = Buffer.from(host);
-  return Buffer.concat([
-    Buffer.from([0x00]),        // version
-    uuid,                       // 16 bytes uuid
-    Buffer.from([0x00]),        // opt length = 0
-    Buffer.from([0x01]),        // command: TCP
+  const head = Buffer.concat([
+    Buffer.from([0x00]),                 // version
+    uuid,                                // 16 bytes uuid
+    Buffer.from([0x00]),                 // opt length = 0
+    Buffer.from([0x01]),                 // command: TCP
     Buffer.from([(port >> 8) & 0xff, port & 0xff]), // port big-endian
-    Buffer.from([0x02, hostBuf.length]), // addrType=2 domain
-    hostBuf,
-    Buffer.from(payload),
   ]);
+  if (addrType === 2) {
+    const hostBuf = Buffer.from(host);
+    return Buffer.concat([head, Buffer.from([0x02, hostBuf.length]), hostBuf, Buffer.from(payload)]);
+  }
+  // addrType=1 ipv4（地址类型 1 字节 + 4 字节 IP，无长度前缀）
+  return Buffer.concat([head, Buffer.from([0x01]), Buffer.from(host.split('.').map(Number)), Buffer.from(payload)]);
+}
+
+async function testWsUpgrade(label, request, sendFirstMessage) {
+  const result = await vlessOnRequest({ request, env: {}, waitUntil: () => {} });
+  if (!result || !result.websocket) {
+    console.log(`[${label}] FAIL ❌  (未返回 { websocket: handlers })`);
+    return false;
+  }
+  const ws = new MockWS();
+  await result.websocket.onopen(ws, request);
+  if (sendFirstMessage) await result.websocket.onmessage(ws, sendFirstMessage, true);
+  await new Promise(r => setTimeout(r, 6000));
+  const total = Buffer.concat(ws.sent);
+  const ok = total.length > 2 && total.toString('utf8', 2).includes('HTTP/1.1');
+  console.log(`[${label}] received ${total.length} bytes, head hex=${total.subarray(0, 4).toString('hex')} -> ${ok ? 'PASS ✅' : 'FAIL ❌'}`);
+  return ok;
 }
 
 async function main() {
-  const request = new Request('https://test.edgeone.app/vless?ed=2048', {
-    headers: { upgrade: 'websocket', 'sec-websocket-protocol': '' },
-  });
-  const context = { request, env: {}, waitUntil: () => {} };
+  let allOk = true;
 
-  const result = await onRequest(context);
-  // 官方 API：升级请求应返回 { websocket: {onopen,onmessage,...} }
-  console.log('upgrade result keys =', Object.keys(result || {}));
-  if (!result || !result.websocket) {
-    console.log('SMOKE TEST FAIL ❌  (未返回官方 websocket handler 对象)');
-    process.exit(1);
+  // --- 1. 普通 WS 路径：首消息带 VLESS 头 ---
+  {
+    const request = new Request('https://test.edgeone.app/vless?ed=2048', {
+      headers: { upgrade: 'websocket', 'sec-websocket-protocol': '' },
+    });
+    const buf = buildVlessRequest('example.com', 80,
+      'GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n');
+    allOk = (await testWsUpgrade('ws-normal', request, buf)) && allOk;
   }
 
-  const ws = new MockWS();
-  await result.websocket.onopen(ws, request);
-  console.log('onopen done');
-
-  const vlessBuf = buildVlessRequest('example.com', 80,
-    'GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n');
-  await result.websocket.onmessage(ws, vlessBuf, true);
-
-  await new Promise(r => setTimeout(r, 6000));
-
-  const total = Buffer.concat(ws.sent);
-  console.log('received bytes from remote:', total.length);
-  console.log('body preview:', total.toString('utf8').slice(0, 200));
-  if (total.length > 2 && total.toString('utf8', 2).includes('HTTP/1.1')) {
-    console.log('SMOKE TEST PASS ✅  (VLESS 头剥离 + vless resp header 前缀 + TCP 全链路 ok)');
-    process.exit(0);
+  // --- 2. ed=2048 early data：VLESS 首包经 base64url 放进 sec-websocket-protocol ---
+  {
+    const buf = buildVlessRequest('example.com', 80,
+      'GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n');
+    const b64 = buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const request = new Request('https://test.edgeone.app/vless?ed=2048', {
+      headers: { upgrade: 'websocket', 'sec-websocket-protocol': b64 },
+    });
+    allOk = (await testWsUpgrade('ws-early-data', request, null)) && allOk;
   }
-  console.log('SMOKE TEST FAIL ❌');
-  process.exit(1);
+
+  // --- 3. IPv4 地址类型 ---
+  {
+    const request = new Request('https://test.edgeone.app/vless', {
+      headers: { upgrade: 'websocket' },
+    });
+    const buf = buildVlessRequest('1.1.1.1', 80,
+      'GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n', 1);
+    allOk = (await testWsUpgrade('ws-ipv4', request, buf)) && allOk;
+  }
+
+  // --- 4. [[default]].ts：/debug 端点 ---
+  {
+    const resp = await defaultOnRequest({
+      request: new Request('https://t.app/debug'),
+      env: {},
+    });
+    const data = await resp.json();
+    console.log('[/debug]', JSON.stringify(data));
+    if (!data.dns || data.dns.status !== 'ok') allOk = false;
+  }
+
+  // --- 5. [[default]].ts：/<UUID> 配置页 + 升级拒绝 ---
+  {
+    const uuid = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
+    const resp = await defaultOnRequest({
+      request: new Request(`https://t.app/${uuid}`),
+      env: {},
+    });
+    const text = await resp.text();
+    const cfgOk = text.includes('vless://') && text.includes('/vless?ed=2048');
+    console.log(`[config page] ${cfgOk ? 'PASS ✅' : 'FAIL ❌'} (${text.length} chars)`);
+    allOk = allOk && cfgOk;
+
+    const resp2 = await defaultOnRequest({
+      request: new Request('https://t.app/anything', { headers: { upgrade: 'websocket' } }),
+      env: {},
+    });
+    console.log(`[catch-all upgrade] status=${resp2.status} (期望 426)`);
+    allOk = allOk && resp2.status === 426;
+  }
+
+  console.log(allOk ? 'ALL TESTS PASS ✅' : 'SOME TESTS FAILED ❌');
+  process.exit(allOk ? 0 : 1);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
