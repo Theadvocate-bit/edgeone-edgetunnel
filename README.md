@@ -93,20 +93,81 @@ node test/run.mjs
 
 ## 排障记录
 
-- **WS 升级 500**：根因是在升级请求中使用了 `WebSocketPair`（该 API 在 EdgeOne Node Functions 运行时不存在，属于 Cloudflare 写法）。正确方式是返回 `{ websocket: { onopen, onmessage, onclose, onerror } }`，由平台完成 101 握手。已与官方 `TencentEdgeOne/pages-ai-voice-chat` 模板逐行核对：API 形状、回调签名、`ws.send(Buffer)` 数据类型均一致。
-- **WS 桥接未建立（平台层面 500，101 握手前被打断）**：官方确认平台未给项目接上 WebSocket 桥接。对策（本轮已全部落实）：
-  1. WS 处理移入**官方同形态文件** `websocket.ts`（官方代码同时接受 `/websocket` 与 `/ws`，说明平台把升级请求统一路由到该文件名）；
-  2. `package.json` 对齐官方：`"type": "commonjs"` + `dependencies.ws`（构建产物形态一致性）；
-  3. 保留 `vless.ts` 兼容路由，`/vless` 路径同样可用；
-  4. `/debug` 端点新增 `forwardedHeaders` 回显，辅助诊断平台转发行为。
-  若重新部署后仍 500，向 EdgeOne 官方反馈（其已确认桥接缺失属平台问题），并索要已验证可用的最小 WS 示例。
+### ⚠️ 最终结论（2026-11-14，线上实测定性）：当前平台状态无法承载隧道
+
+经过 v1→v13 共 13 轮迭代与系统化线上诊断，EdgeOne Pages Node Functions 在当前状态下
+**无法承载 VLESS/代理类隧道**。全部证据（通过跨隔离 ntfy.sh 诊断流 + raw TLS 帧级观测获得）：
+
+| 平台能力 | 实测结果 |
+|---|---|
+| WS 101 握手 | ✅ 正常（`websocket.ts` + `commonjs` + `tsconfig.json` 对齐官方形态后建立） |
+| `onopen` 回调 | ✅ 触发，`readyState=1`，`ws.send` 不抛错、`bufferedAmount=0` |
+| **WS 入站帧（客户端→函数）** | ❌ 从不触发 `onmessage`（唯一例外：升级请求头 `sec-websocket-protocol` 的 early-data 能到达） |
+| **WS 出站帧（函数→客户端）** | ❌ 完全不中继——数据帧、close 帧全部丢失，客户端 TCP 0 字节，约 200ms 后服务端 ws 被平台以 1001 关闭 |
+| 流式响应（GET 下载） | ✅ 完美（chunk 以精确间隔逐块到达，无缓冲） |
+| 流式请求体 | ❌ `request.body` 为 null（缓冲读取 `request.text()` 可用） |
+| **实例亲和性（跨请求内存状态）** | ❌ **每个请求都是全新沙箱**（模块级计数器每次 count=1，同一 keepalive 连接内亦如此） |
+| 出站 TCP（`node:net`） | ✅ 全通（example.com:80 → ~5ms） |
+| 单次调用墙钟 | ~30s |
+
+代理隧道的本质要求（长生命周期 TCP 会话 + 双向实时数据流）与上述约束全面冲突：
+WS 数据面死掉 + 无跨请求状态 + 无流式上传，任何标准协议传输（ws/xhttp/grpc）均不可行。
+
+**可行出路**：
+1. **向 EdgeOne 官方反馈 WS 桥接缺陷**（证据完备：握手正常/回调正常/双向帧全死/200ms 关闭/readyState=1/send 零异常）。桥接修复后本项目代码**立即可用**（配置生成、域名跟随、PROXYIP 重试、超时保护均已就绪）；
+2. 原版 edgetunnel 回归 **Cloudflare Workers**（其原生运行环境，开箱即用）；
+3. 或改用支持 WS + raw TCP 的其它运行时（Deno Deploy、VPS 等）。
+
+## V14 新增：多传输端点与多节点并存
+
+在 WS 数据面缺陷未修复期间，v14 提供了基于已验证可用能力（流式响应 / 缓冲请求体 / `node:net` TCP / `node:dgram` 待探测）的替代传输端点：
+
+### 节点 2 · XHTTP 事务模式（`node-functions/xhttp.ts`）
+
+「一请求 = 一事务」的自包含隧道（**非 xray xhttp 兼容**——平台无跨请求状态，xray 的会话语义无法实现，需按下列 API 自建客户端）：
+
+```
+POST /xhttp?addr=<host>&port=<n>            # raw 模式：body=完整上行 → 流式下行
+POST /xhttp?mode=vless                      # VLESS 帧：地址/端口从头解析，回传带 VLESS 响应头
+GET  /xhttp?addr=<host>&port=<n>            # 仅监听下载（不发送上行）
+d=<base64url>                               # 小段上行可走查询参数
+```
+
+- 下载方向：流式响应逐块下发（已实测完美）✅
+- 上行方向：整包缓冲（`arrayBuffer` → `_rawBodyBuffer` → `text` 三路探测兜底）——**渐进式上行受平台限制（`request.body` 为 null）不可用**
+- 超时保护：连接 8s / 空闲 15s / 总时长 25s（平台 30s 墙钟内安全收尾）
+- PROXYIP 重试、VLESS 响应头拼接与 WS 版同源
+
+### 节点 3 · UDP 逐包中继（`node-functions/udp.ts`）
+
+```
+GET  /udp                                   # 探测：dgram 是否可用 + 实测 DNS over UDP
+POST /udp?host=<ip>&port=<n>                # body=UDP 载荷 → 收集响应（静默 400ms）→ 返回
+                                            # 多响应以 2 字节大端长度前缀分帧（X-UDP-Responses 头标注数量）
+```
+
+- `node:dgram` 动态导入（平台不提供时优雅降级为 JSON 说明）
+- 适用于 DNS 等一问一答型 UDP 流量
+
+### Hysteria2 为什么没有节点
+
+Hysteria2 服务端需要 **QUIC 协议栈**（TLS1.3 握手、连接级状态机、持久 UDP socket）。本平台：沙箱逐请求重建（无跨请求状态）+ 运行时无 QUIC —— 无法承载 Hysteria2 服务端，配置页不生成虚假的 `hysteria2://` 节点。UDP 路线的可用产出即节点 3 的逐包中继。
+
+### 多节点并存配置
+
+`/<UUID>` 配置页自 v14 起输出**多节点并存**完整文本：节点 1（VLESS+WS，标准协议，平台修复后立即可用）+ 节点 2（XHTTP 事务模式，含 curl 示例）+ 节点 3（UDP 中继）+ Hysteria2 说明与全部自诊断端点索引。
+
+### 诊断端点（保留可用）
+
+- `GET /debug` — DNS / 出站 TCP 自检 + 请求头回显 + WS 诊断缓冲
+- `GET /stream-out`、`POST /stream-in`、`GET /affinity` — 平台能力探针（流式响应/请求体/实例亲和性）
+
+### 历史排障
+
+- **WS 升级 500**：根因是在升级请求中使用了 `WebSocketPair`（该 API 在 EdgeOne Node Functions 运行时不存在，属于 Cloudflare 写法）。正确方式是返回 `{ websocket: { onopen, onmessage, onclose, onerror } }`，由平台完成 101 握手。
+- **WS 桥接部分建立**：对齐官方形态（`websocket.ts` 文件名 + `"type": "commonjs"` + `node-functions/tsconfig.json` + 内联字面量返回）后，101 握手与 onopen 回调恢复正常——但数据帧仍不中继（见上「最终结论」）。
 - **回传数据缺 VLESS 响应头**：客户端无法识别首包。需在 TCP 出站首次收到数据时拼接 `[version, 0x00]` 两字节（DNS 路径同理）。
-- **连接不上**：按以下顺序排查
-  1. **访问 `https://<你的域名>/debug`**——自诊断端点会实测 DNS 解析和 3 个目标的出站 TCP（带 5 秒超时）。若全部 timeout/error，说明 EdgeOne 节点出站被限制，此平台无法承载该用途；
-  2. **客户端日志显示 `bad handshake`**——CDN 层 WebSocket 未开启。使用**自定义域名**时需在 EdgeOne 控制台「站点加速 → 网络优化 → WebSocket」开启（站点级或规则引擎对该域名开启）；Pages 默认域名一般已开启；
-  3. **连接约 30 秒后断开**——平台单次调用墙上时间限制，客户端自动重连即可；
-  4. **个别目标不通**——目标从 EdgeOne 节点出站不可达，配置 `PROXYIP` 后重试（函数已内置 8 秒连接超时，不可达目标会快速失败并触发重试）；
-  5. **Pages 控制台「日志」页**可查看函数 console.log 输出（连接建立、tcp error、dns 等均有日志）。
+- **自定义域名跟随**：平台转发会把 Host 改写为内部回源地址，但保留在 **`eo-pages-host`** 头中。域名解析优先级：`CUSTOM_DOMAIN` 环境变量 > `eo-pages-host` > `X-Forwarded-Host` > `url.hostname` > `Host`。
 
 ## 免责声明
 

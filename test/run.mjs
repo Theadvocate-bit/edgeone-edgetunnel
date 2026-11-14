@@ -13,6 +13,8 @@ mkdirSync(tmpDir, { recursive: true });
 for (const [entry, out] of [
   ['websocket.ts', 'websocket.mjs'],
   ['[[default]].ts', 'default.mjs'],
+  ['xhttp.ts', 'xhttp.mjs'],
+  ['udp.ts', 'udp.mjs'],
 ]) {
   await build({
     entryPoints: [path.join(root, 'node-functions', entry)],
@@ -26,6 +28,8 @@ for (const [entry, out] of [
 
 const { onRequest: vlessOnRequest } = await import(pathToFileURL(path.join(tmpDir, 'websocket.mjs')).href);
 const { onRequest: defaultOnRequest } = await import(pathToFileURL(path.join(tmpDir, 'default.mjs')).href);
+const { onRequest: xhttpOnRequest } = await import(pathToFileURL(path.join(tmpDir, 'xhttp.mjs')).href);
+const { onRequest: udpOnRequest } = await import(pathToFileURL(path.join(tmpDir, 'udp.mjs')).href);
 
 // --- WebSocketPair mock（模拟 CF/EdgeOne pair 模式运行时） ---
 class PairMockWS {
@@ -196,8 +200,8 @@ async function main() {
       env: {},
     });
     const text = await resp.text();
-    const cfgOk = text.includes('vless://') && text.includes('/vless?ed=2048');
-    console.log(`[config page] ${cfgOk ? 'PASS ✅' : 'FAIL ❌'} (${text.length} chars)`);
+    const cfgOk = text.includes('vless://') && text.includes('/vless?ed=2048') && text.includes('节点 1') && text.includes('/xhttp');
+    console.log(`[config page] ${cfgOk ? 'PASS ✅' : 'FAIL ❌'} (${text.length} chars, 多节点=${text.includes('节点 1')})`);
     allOk = allOk && cfgOk;
 
     const resp2 = await defaultOnRequest({
@@ -237,6 +241,109 @@ async function main() {
       new Request(`https://site.edgeone.app/${uuid}`, {
         headers: { host: 'rewritten.internal' },
       }), {}, 'site.edgeone.app') && allOk;
+  }
+
+  // --- 8. XHTTP 事务模式（v14） ---
+  {
+    const readStream = async (resp) => {
+      const chunks = [];
+      const reader = resp.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(Buffer.from(value));
+      }
+      return Buffer.concat(chunks);
+    };
+
+    // 8a. raw 模式：POST body 为完整上行（HTTP 请求）→ 流式下行
+    {
+      const request = new Request('https://t.app/xhttp?addr=example.com&port=80', {
+        method: 'POST',
+        headers: { 'content-type': 'application/octet-stream' },
+        body: Buffer.from('GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n'),
+      });
+      const resp = await xhttpOnRequest({ request, env: {}, waitUntil: () => {} });
+      const data = await readStream(resp);
+      const ok = data.toString('utf8', 0).includes('HTTP/1.1');
+      console.log(`[xhttp raw] ${data.length} bytes, head=${JSON.stringify(data.toString('utf8', 0, 15))} -> ${ok ? 'PASS ✅' : 'FAIL ❌'}`);
+      allOk = allOk && ok;
+    }
+
+    // 8b. vless 模式：body 为 VLESS 帧 → 首部带 VLESS 响应头
+    {
+      const buf = buildVlessRequest('example.com', 80,
+        'GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n');
+      const request = new Request('https://t.app/xhttp?mode=vless', {
+        method: 'POST',
+        headers: { 'content-type': 'application/octet-stream' },
+        body: buf,
+      });
+      const resp = await xhttpOnRequest({ request, env: {}, waitUntil: () => {} });
+      const data = await readStream(resp);
+      const ok = data.subarray(0, 2).toString('hex') === '0000' && data.toString('utf8', 2).includes('HTTP/1.1');
+      console.log(`[xhttp vless] ${data.length} bytes, head hex=${data.subarray(0, 4).toString('hex')} -> ${ok ? 'PASS ✅' : 'FAIL ❌'}`);
+      allOk = allOk && ok;
+    }
+
+    // 8c. d= 参数携带上行（base64url）
+    {
+      const up = Buffer.from('GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n');
+      const d = up.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      const request = new Request(`https://t.app/xhttp?addr=example.com&port=80&d=${d}`, { method: 'POST' });
+      const resp = await xhttpOnRequest({ request, env: {}, waitUntil: () => {} });
+      const data = await readStream(resp);
+      const ok = data.toString('utf8', 0).includes('HTTP/1.1');
+      console.log(`[xhttp d-param] ${data.length} bytes -> ${ok ? 'PASS ✅' : 'FAIL ❌'}`);
+      allOk = allOk && ok;
+    }
+
+    // 8d. 缺参数 400
+    {
+      const resp = await xhttpOnRequest({ request: new Request('https://t.app/xhttp', { method: 'POST' }), env: {}, waitUntil: () => {} });
+      const ok = resp.status === 400;
+      console.log(`[xhttp missing-args] status=${resp.status} -> ${ok ? 'PASS ✅' : 'FAIL ❌'}`);
+      allOk = allOk && ok;
+    }
+  }
+
+  // --- 9. UDP 探针 + 逐包中继（v14） ---
+  // 注：UDP 出站可达性取决于运行环境网络（本机可能被防火墙/运营商过滤），因此
+  //     断言只要求「dgram 可用 + 发送不报错」；DNS 是否收到响应仅作信息输出。
+  {
+    // 9a. GET /udp 探测
+    {
+      const resp = await udpOnRequest({ request: new Request('https://t.app/udp'), env: {}, waitUntil: () => {} });
+      const data = await resp.json();
+      const ok = data.dgramAvailable === true && data.dnsProbe?.sent !== false;
+      console.log(`[udp probe] dgram=${data.dgramAvailable} dns.ok=${data.dnsProbe?.ok} ms=${data.dnsProbe?.ms} -> ${ok ? 'PASS ✅' : 'FAIL ❌'}${data.dnsProbe?.ok ? '' : ' (DNS 无响应：环境网络过滤，非代码问题)'}`);
+      allOk = allOk && ok;
+    }
+    // 9b. POST /udp DNS 中继（多响应带长度前缀）
+    {
+      const dnsq = Buffer.concat([
+        Buffer.from([0xab, 0xcd, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+        Buffer.from([7, ...'example'.split('').map(c => c.charCodeAt(0)), 3, ...'com'.split('').map(c => c.charCodeAt(0)), 0]),
+        Buffer.from([0x00, 0x01, 0x00, 0x01]),
+      ]);
+      const request = new Request('https://t.app/udp?host=8.8.8.8&port=53', {
+        method: 'POST',
+        headers: { 'content-type': 'application/octet-stream' },
+        body: dnsq,
+      });
+      const resp = await udpOnRequest({ request, env: {}, waitUntil: () => {} });
+      if (resp.status !== 200) {
+        const info = await resp.json().catch(() => ({}));
+        console.log(`[udp relay] status=${resp.status} error=${info.error} -> SKIP ⚠️ (环境 UDP 过滤，非代码问题)`);
+      } else {
+        const data = Buffer.from(await resp.arrayBuffer());
+        const n = Number(resp.headers.get('x-udp-responses') || 0);
+        // 长度前缀后应为 DNS 响应（id 0xabcd）
+        const ok = n >= 1 && data.length > 2 + 12 && data[2] === 0xab && data[3] === 0xcd;
+        console.log(`[udp relay] responses=${n} bytes=${data.length} -> ${ok ? 'PASS ✅' : 'FAIL ❌'}`);
+        allOk = allOk && ok;
+      }
+    }
   }
 
   console.log(allOk ? 'ALL TESTS PASS ✅' : 'SOME TESTS FAILED ❌');

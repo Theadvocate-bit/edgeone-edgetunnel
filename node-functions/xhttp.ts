@@ -1,169 +1,230 @@
-// XHTTP (splitted-HTTP) 传输 —— 用普通 HTTP POST/GET 承载 VLESS，绕开平台 WS 桥接限制。
+// EdgeOne Pages Node Functions —— XHTTP 事务模式（v14）
 //
-// 平台约束（v7~v13 实测）：
-//   - WS 桥接：握手 101 但服务端 ws.send() 帧不回传客户端（平台硬限制）。
-//   - 函数约 30s 硬超时 => 单次下行 GET 流式必须在 ~22s 内结束，由客户端带 seq 重连。
-//   - 实例无状态（每请求可能新 isolate）=> 会话存模块级 Map（暖实例窗口内共享）。
+// 平台实测约束（README「最终结论」）：
+//   - 流式响应可用      → 下载方向：响应体逐块流式下发 ✅
+//   - 流式请求体不可用  → 上行方向：只能整包缓冲（arrayBuffer/_rawBodyBuffer/text 三路探测）
+//   - 沙箱逐请求重建    → TCP 会话无法跨请求存活 → 无法实现 xray xhttp 的会话语义
 //
-// 协议：
-//   POST   /xhttp/<uuid>      body = VLESS 数据分片（首片含 VLESS 头：目标地址+端口）；返回 200。
-//   GET    /xhttp/<uuid>?seq=N  下行长轮询：返回上游回程原始字节（application/octet-stream，无帧）。
-//                               X-XHTTP-Error 头 = 上游错误；流结束即本轮终止（客户端带新 seq 重连）。
-//   DELETE /xhttp/<uuid>      关闭会话 / 上游 socket。
+// 因此本端点是「一请求 = 一事务」的自包含隧道（非 xray 兼容，需自定义客户端）：
+//
+//   POST /xhttp?addr=<host>&port=<n>&mode=raw[&d=<base64url 上行>]
+//     body: 完整上行字节（如一条完整 HTTP 请求）
+//     响应: 流式下行字节（目标服务器的应答）
+//
+//   POST /xhttp?mode=vless   （VLESS 帧：地址/端口从 VLESS 头解析，回传带 VLESS 响应头）
+//
+//   GET  /xhttp              （端点说明 JSON）
+//
+// 超时保护：连接 8s / 空闲 15s / 总时长 25s（平台 30s 墙钟内安全收尾）。
 
 import net from 'node:net';
-import { processVlessHeader, isValidUUID } from './websocket.ts';
+import { processVlessHeader } from './websocket.ts';
+import { readBodyBuffer, b64urlToBuffer } from './util.ts';
 
-interface XhttpSession {
-  socket: net.Socket | null;
-  buffer: Buffer[];
-  bufferedBytes: number;
-  nextSeq: number;      // 下行已生成数据的累计序号（供客户端 ?seq= 续传）
-  lastSeen: number;
-  established: boolean;
-  ended: boolean;       // 上游已关闭/出错
-  error: string | null; // 上游错误信息（若有）
-  target: string;
-  port: number;
+const CONNECT_TIMEOUT = 8000;
+const IDLE_TIMEOUT = 15000;
+const HARD_DEADLINE = 25000;
+
+interface TunnelResult {
+  stream: ReadableStream;
+  dialAddr: string;
+  dialPort: number;
+  uplinkHow: string;
+  uplinkBytes: number;
 }
 
-const SESSION_TTL_MS = 120_000;
-const STREAM_MAX_MS = 22_000;   // 单次 GET 流式上限（< 平台 30s 硬超时）
-const MAX_BUFFER_BYTES = 4 * 1024 * 1024;
+function runTunnel(
+  address: string,
+  port: number,
+  uplink: Buffer | null,
+  mode: string,
+  proxyIP: string,
+  vlessRespHeader: Buffer | null = null
+): TunnelResult {
+  let vlessHeaderPending: Buffer | null = vlessRespHeader;
+  let retried = false;
+  let gotData = false;
 
-const sessions = new Map<string, XhttpSession>();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      let socket: net.Socket | null = null;
+      let idleTimer: any = null;
+      let hardTimer: any = null;
+      let connTimer: any = null;
+      let closed = false;
 
-function getSession(id: string): XhttpSession | undefined { return sessions.get(id); }
+      const clearTimers = () => {
+        for (const t of [idleTimer, hardTimer, connTimer]) clearTimeout(t);
+        idleTimer = hardTimer = connTimer = null;
+      };
+      const finish = () => {
+        if (closed) return;
+        closed = true;
+        clearTimers();
+        try { socket?.destroy(); } catch { /* ignore */ }
+        try { controller.close(); } catch { /* ignore */ }
+      };
+      const armIdle = () => {
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(finish, IDLE_TIMEOUT);
+      };
 
-function destroySession(id: string) {
-  const s = sessions.get(id);
-  if (s?.socket) { try { s.socket.destroy(); } catch { /* ignore */ } }
-  sessions.delete(id);
-}
+      const dial = (host: string, p: number, isRetry: boolean) => {
+        let s: net.Socket;
+        try {
+          s = net.connect({ host, port: p });
+        } catch {
+          finish();
+          return;
+        }
+        socket = s;
+        s.setNoDelay(true);
+        connTimer = setTimeout(() => {
+          s.destroy();
+          if (!isRetry && !retried && proxyIP) {
+            retried = true;
+            dial(proxyIP, p, true);
+          } else {
+            finish();
+          }
+        }, CONNECT_TIMEOUT);
 
-function sweep() {
-  const now = Date.now();
-  for (const [id, s] of sessions) if (now - s.lastSeen > SESSION_TTL_MS) destroySession(id);
-}
+        s.once('connect', () => {
+          clearTimeout(connTimer);
+          hardTimer = setTimeout(finish, HARD_DEADLINE);
+          armIdle();
+          if (uplink && uplink.length) s.write(uplink);
+        });
 
-function ensureSession(id: string): XhttpSession {
-  let s = sessions.get(id);
-  if (!s) {
-    s = { socket: null, buffer: [], bufferedBytes: 0, nextSeq: 0, lastSeen: Date.now(), established: false, ended: false, error: null, target: '', port: 0 };
-    sessions.set(id, s);
-  }
-  s.lastSeen = Date.now();
-  return s;
-}
+        s.on('data', (d: Buffer) => {
+          gotData = true;
+          armIdle();
+          let out: Buffer = d;
+          if (mode === 'vless' && vlessHeaderPending) {
+            out = Buffer.concat([vlessHeaderPending, d]);
+            vlessHeaderPending = null;
+          }
+          try {
+            controller.enqueue(new Uint8Array(out));
+          } catch {
+            s.destroy();
+          }
+        });
 
-function ensureUpstream(s: XhttpSession, host: string, port: number, initial: Buffer): void {
-  if (s.socket) return;
-  s.target = host; s.port = port;
-  const socket = net.connect({ host, port });
-  s.socket = socket;
-  socket.setNoDelay(true);
-  socket.on('connect', () => {
-    s.established = true;
-    if (initial.length) socket.write(initial);
+        s.on('close', () => {
+          if (!gotData && !isRetry && !retried && proxyIP) {
+            retried = true;
+            dial(proxyIP, p, true);
+            return;
+          }
+          finish();
+        });
+
+        s.on('error', () => finish());
+      };
+
+      dial(address, port, false);
+    },
+    cancel() {
+      // 客户端中断：由 finish 内部 destroy 兜底（cancel 触发时 controller 已不可用）
+    },
   });
-  socket.on('data', (chunk: Buffer) => {
-    if (s.bufferedBytes < MAX_BUFFER_BYTES) { s.buffer.push(chunk); s.bufferedBytes += chunk.length; }
-  });
-  socket.on('error', (err: Error) => { s.ended = true; s.error = err.message; });
-  socket.on('close', () => { s.ended = true; });
+
+  return { stream, dialAddr: address, dialPort: port, uplinkHow: '', uplinkBytes: uplink?.length || 0 };
 }
 
-async function handleUpload(id: string, data: Buffer): Promise<void> {
-  const s = ensureSession(id);
-  if (data.length === 0) return;
-  if (!s.socket) {
-    const { hasError, message, addressRemote, portRemote, rawDataIndex } = processVlessHeader(data, id);
-    if (hasError) { s.ended = true; s.error = 'vless header: ' + message; return; }
-    const payload = Buffer.from(data.subarray(rawDataIndex));
-    ensureUpstream(s, addressRemote, portRemote, payload);
-  } else if (!s.ended) {
-    try { s.socket.write(data); } catch { /* ignore */ }
-  }
+function json(obj: any, status = 200): Response {
+  return new Response(JSON.stringify(obj, null, 2), {
+    status,
+    headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store' },
+  });
 }
 
 /**
- * 处理 XHTTP 请求（由 [[default]].ts catch-all 调用）。
- * 返回 Response，或 null 表示非 /xhttp 路径（交回默认处理）。
+ * @param {any} context EdgeOne Node Functions EventContext
  */
-export async function handleXhttp(context: any): Promise<Response | null> {
+export async function onRequest(context: any) {
   const { request, env } = context;
-  const url = new URL(request.url);
-  if (!url.pathname.startsWith('/xhttp')) return null;
+  const proxyIP: string = env?.PROXYIP || '';
 
-  const method = (request as any).method;
-  const uid = env?.UUID || 'd342d11e-d424-4583-b36e-524ab1f0afa4';
+  try {
+    const url = new URL(request.url);
+    const sp = url.searchParams;
 
-  if (url.pathname === '/xhttp' || url.pathname === '/xhttp/') {
-    return new Response(
-      'XHTTP transport.\nPOST   /xhttp/<uuid>        upload VLESS chunks (first carries VLESS header)\nGET    /xhttp/<uuid>?seq=N  downstream poll (raw bytes)\nDELETE /xhttp/<uuid>        close session\n',
-      { status: 200, headers: { 'Content-Type': 'text/plain;charset=utf-8' } }
-    );
-  }
+    // 端点说明
+    if (request.method === 'GET' && !sp.get('addr') && !sp.get('d') && sp.get('mode') !== 'vless') {
+      return json({
+        endpoint: 'XHTTP transaction tunnel (one request = one transaction)',
+        platformConstraints: {
+          streamingResponse: 'OK (download direction)',
+          streamingRequestBody: 'NOT available (uplink must be fully buffered)',
+          instanceAffinity: 'NONE (TCP session cannot persist across requests)',
+          wallClockLimit: '~30s (hard deadline 25s built-in)',
+        },
+        usage: {
+          raw: 'POST /xhttp?addr=<host>&port=<n>  body=<完整上行字节>  -> 流式下行字节',
+          vless: 'POST /xhttp?mode=vless  body=<VLESS 帧>  -> VLESS 响应头 + 流式下行字节',
+          earlyUplink: '任意请求可用 d=<base64url> 参数携带小段上行',
+          downloadOnly: 'GET /xhttp?addr=<host>&port=<n>  （仅监听目标输出）',
+        },
+        note: '非 xray xhttp 兼容（平台无跨请求状态）；配合自定义客户端使用。',
+      });
+    }
 
-  const id = url.pathname.slice('/xhttp/'.length).split('/')[0];
-  if (!id || !isValidUUID(id)) {
-    return new Response('bad session id\n', { status: 400, headers: { 'Content-Type': 'text/plain;charset=utf-8' } });
-  }
+    const mode: string = sp.get('mode') || 'raw';
 
-  if (method === 'POST') {
-    try { sweep(); } catch { /* ignore */ }
-    const raw = await request.arrayBuffer();
-    await handleUpload(id, Buffer.from(raw));
-    return new Response(null, { status: 200, headers: { 'Cache-Control': 'no-store' } });
-  }
+    // 上行数据：body 优先，其次 d= 参数
+    const { buf: bodyBuf, how } = await readBodyBuffer(request);
+    const dBuf = b64urlToBuffer(sp.get('d') || '');
+    const uplink: Buffer | null = bodyBuf && bodyBuf.length ? bodyBuf : dBuf;
 
-  if (method === 'GET') {
-    const existing = getSession(id);
-    const s = ensureSession(id);
-    const since = parseInt(url.searchParams.get('seq') || '0', 10) || 0;
-    const started = Date.now();
-    let cursor = since;          // 已下发的累计字节序号
-    const stream = new ReadableStream({
-      start(controller) {
-        let closed = false;
-        const finish = () => { if (!closed) { closed = true; clearInterval(timer); try { controller.close(); } catch { /* ignore */ } } };
-        const timer = setInterval(() => {
-          if (closed) return;
-          const elapsed = Date.now() - started;
-          // 冲刷所有尚未下发的 buffer 数据
-          while (s.buffer.length) {
-            const item = s.buffer.shift()!;
-            s.bufferedBytes -= item.length;
-            try { controller.enqueue(new Uint8Array(item)); cursor += item.length; }
-            catch { finish(); return; }
-          }
-          // 上游已结束且无残留数据 => 结束本轮（客户端看到流关闭）
-          if (s.ended && s.buffer.length === 0) { finish(); return; }
-          // 单次流式上限 => 结束本轮（客户端带 ?seq=cursor 重连）
-          if (elapsed >= STREAM_MAX_MS) { finish(); return; }
-        }, 150);
+    let addr = (sp.get('addr') || '').trim();
+    let port = Number(sp.get('port') || 0);
+
+    if (mode === 'vless') {
+      if (!uplink || uplink.length < 24) {
+        return json({ error: 'mode=vless 需要 VLESS 帧上行（body 或 d= 参数）', uplinkHow: how }, 400);
+      }
+      const parsed = processVlessHeader(uplink, String(env?.UUID || 'd342d11e-d424-4583-b36e-524ab1f0afa4'));
+      if (parsed.hasError) {
+        return json({ error: `VLESS 头解析失败: ${parsed.message}` }, 400);
+      }
+      addr = parsed.addressRemote;
+      port = parsed.portRemote;
+      const vlessRespHeader = Buffer.from([parsed.vlessVersion[0], 0]);
+      const result = runTunnel(addr, port, uplink, 'vless', proxyIP, vlessRespHeader);
+      return new Response(result.stream, {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'X-Accel-Buffering': 'no',
+          'Cache-Control': 'no-store',
+          'X-EO-Tunnel': `vless ${addr}:${port} uplink=${uplink.length}(${how})`,
+        },
+      });
+    }
+
+    // mode=raw：支持 host:port 简写
+    if (addr && addr.includes(':') && !addr.includes(']')) {
+      const i = addr.lastIndexOf(':');
+      const p = Number(addr.slice(i + 1));
+      if (p > 0) { port = p; addr = addr.slice(0, i); }
+    }
+    if (!addr || !port) {
+      return json({ error: '缺少 addr/port 参数', usage: 'POST /xhttp?addr=<host>&port=<n>  body=<上行字节>' }, 400);
+    }
+
+    const result = runTunnel(addr, port, uplink, 'raw', proxyIP);
+    return new Response(result.stream, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'X-Accel-Buffering': 'no',
+        'Cache-Control': 'no-store',
+        'X-EO-Tunnel': `raw ${addr}:${port} uplink=${uplink?.length || 0}(${how})`,
       },
     });
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/octet-stream',
-      'X-Accel-Buffering': 'no',
-      'Cache-Control': 'no-store',
-      // 临时隔离诊断：GET 落到的 isolate 是否能看到 POST 创建的会话/socket
-      'X-DBG-Pre': existing ? '1' : '0',
-      'X-DBG-Socket': s.socket ? '1' : '0',
-      'X-DBG-Buf': String(s.buffer.length),
-      'X-DBG-Ended': s.ended ? '1' : '0',
-      'X-DBG-Sessions': String(sessions.size),
-    };
-    if (s.error) headers['X-XHTTP-Error'] = s.error;
-    void cursor;
-    return new Response(stream, { status: 200, headers });
+  } catch (err: any) {
+    return json({ error: err?.message || String(err) }, 500);
   }
-
-  if (method === 'DELETE') {
-    destroySession(id);
-    return new Response(null, { status: 200 });
-  }
-
-  return new Response('method not allowed\n', { status: 405, headers: { 'Content-Type': 'text/plain;charset=utf-8' } });
 }
