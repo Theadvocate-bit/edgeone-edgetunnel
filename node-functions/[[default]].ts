@@ -12,6 +12,10 @@ import { getVLESSConfig, getWsDiag } from './websocket.ts';
 let userID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
 let proxyIP = '';
 
+// 实例亲和性探针：模块级计数器（跨请求存活 => 同一实例 => 有状态会话可行）
+let affinityCount = 0;
+const AFFINITY_BOOT = Math.random().toString(36).slice(2, 8);
+
 /**
  * @param {any} context EdgeOne Node Functions EventContext
  */
@@ -32,6 +36,19 @@ export async function onRequest(context: any) {
 
     const url = new URL(request.url);
     switch (url.pathname) {
+      case '/affinity': {
+        // 实例亲和性探针：连续访问时 count 递增且 boot 相同 => 有状态会话可行
+        affinityCount++;
+        // 顺带探测缓冲请求体是否可用（POST 时）
+        let bufferedBody: string | null = null;
+        if ((request as any).method === 'POST') {
+          try { bufferedBody = (await request.text()).slice(0, 200); } catch (e: any) { bufferedBody = 'ERR: ' + e?.message; }
+        }
+        return new Response(JSON.stringify({ count: affinityCount, boot: AFFINITY_BOOT, bufferedBody }, null, 2), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+        });
+      }
       case '/debug': {
         // 自诊断端点：检查 DNS 与出站 TCP 是否可用
         const diag = await handleDebug();
@@ -78,12 +95,14 @@ export async function onRequest(context: any) {
       }
       case '/stream-in': {
         // 流式请求体能力探针：读 POST body 的每个 chunk 并记录到达时间
+        const bodyType = typeof (request as any).body;
+        const reqKeys = Object.keys(request || {});
         const chunks: number[] = [];
         const times: number[] = [];
         const start = Date.now();
         const reader = (request.body as any)?.getReader?.();
         if (!reader) {
-          return new Response(JSON.stringify({ error: 'no request.body stream' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+          return new Response(JSON.stringify({ bodyType, reqKeys, error: 'no request.body stream' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
         }
         let bytes = 0;
         for (;;) {
