@@ -1,15 +1,13 @@
 /* global WebSocketPair */
 // EdgeOne Pages Node Functions 版 edgetunnel —— WS 端点
 //
-// 重要：本文件刻意复刻官方 WS 模板（TencentEdgeOne/pages-ai-voice-chat）的形态：
-//   1) 文件名固定为 websocket.ts——平台的 WebSocket 桥接按此文件名挂接
-//      （官方代码同时接受 /websocket 与 /ws 两个路径，说明升级请求统一路由到本文件）；
-//   2) package.json 使用 "type": "commonjs" + 依赖 ws——与官方一致，保证构建产物形态一致；
-//   3) .ts 文件——官方所有 WS 模板均为 TS，经构建器 esbuild 打包。
+// 双模式升级（可经 ?ws-mode= 或环境变量 WS_MODE 选择）：
+//   - "handlers"（默认）：返回 { websocket: { onopen, onmessage, onclose, onerror } }
+//     （官方 pages-ai-voice-chat 模板形态）
+//   - "pair"：CF 风格 WebSocketPair + Response(101, webSocket)（若运行时提供 WebSocketPair）
 //
-// WS 升级方式（官方 API）：handler 对升级请求返回
-//   { websocket: { onopen, onmessage, onclose, onerror } }
-// 由平台完成 101 握手并回调事件（运行时不存在 WebSocketPair）。
+// 诊断：所有 WS 事件通过 report() 写入内存缓冲（/debug 可读），并 fire-and-forget
+// 外发到 ntfy.sh topic（跨隔离实例可见），用于排查平台事件派发问题。
 
 import net from 'node:net';
 
@@ -19,6 +17,32 @@ let userID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
 let proxyIP = '';
 
 const WS_PATH = '/vless';
+const DIAG_TOPIC = 'eone-diag-244423673';
+const BOOT_ID = Math.random().toString(36).slice(2, 10);
+
+const wsDiag: string[] = [];
+
+function report(event: string, detail?: any) {
+  let d = '';
+  if (detail !== undefined) {
+    try { d = typeof detail === 'string' ? detail : JSON.stringify(detail); } catch { d = String(detail); }
+  }
+  const line = `[boot:${BOOT_ID}] ${new Date().toISOString()} ${event}${d ? ' ' + d : ''}`;
+  wsDiag.push(line);
+  if (wsDiag.length > 50) wsDiag.shift();
+  console.log('[ws-diag]', line);
+  // fire-and-forget 外发（跨隔离实例可见；平台 101 后不派发事件时这是唯一观测手段）
+  try {
+    void fetch(`https://ntfy.sh/${DIAG_TOPIC}`, {
+      method: 'POST',
+      body: line.slice(0, 800),
+    }).catch(() => { });
+  } catch { /* ignore */ }
+}
+
+export function getWsDiag(): string[] {
+  return wsDiag;
+}
 
 /**
  * @param {any} context EdgeOne Node Functions EventContext
@@ -32,15 +56,32 @@ export async function onRequest(context: any) {
     const upgradeHeader: any = request.headers.get('upgrade');
     if (upgradeHeader?.toLowerCase() === 'websocket') {
       const url = new URL(request.url);
-      // 与官方模板一致：接受 /websocket 与 /ws；另保留 /vless 兼容旧配置。
-      // 平台把升级请求统一路由到 websocket.ts，路径校验仅作防御。
       if (url.pathname !== '/websocket' && url.pathname !== '/ws' && url.pathname !== '/vless') {
         return new Response('Bad WebSocket path', { status: 400 });
       }
-      // EdgeOne 官方 WS 升级方式：返回 { websocket: handlers }，平台完成 101 握手并回调事件
+
+      const mode: string = url.searchParams.get('ws-mode') || env?.WS_MODE || 'handlers';
+      report('upgrade', `path=${url.pathname} mode=${mode} boot=${BOOT_ID}`);
+
+      // ---- 模式 A：CF 风格 WebSocketPair（若运行时提供）----
+      if (mode === 'pair') {
+        if (typeof WebSocketPair === 'undefined') {
+          report('pair mode requested but WebSocketPair undefined');
+          // 落回 handlers 模式
+        } else {
+          const pair = new WebSocketPair();
+          const server = pair[1];
+          wirePairServer(server, request);
+          return new Response(null, {
+            status: 101,
+            webSocket: pair[0],
+            headers: { 'sec-websocket-protocol': request.headers.get('sec-websocket-protocol') || '' },
+          });
+        }
+      }
+
+      // ---- 模式 B：官方 handlers 形态 ----
       const handlers = createVlessWebSocketHandler(request);
-      diag(`upgrade accepted at ${url.pathname}, returning handlers`);
-      // 兼容不同运行时的键名（官方模板为 websocket；附带别名以防派发键名不同）
       return {
         websocket: handlers,
         webSocket: handlers,
@@ -49,69 +90,136 @@ export async function onRequest(context: any) {
       };
     }
 
-    // 非 WS 请求打到 /vless：给出提示
     return new Response(
       `WebSocket endpoint.\nUse wss://<host>${WS_PATH}?ed=2048\nAnd fetch config at /${userID}\n`,
       { status: 426, headers: { 'Content-Type': 'text/plain;charset=utf-8' } }
     );
   } catch (err: any) {
+    report('onRequest error', err?.message || err);
     return new Response(String(err), { status: 500 });
   }
 }
 
 // ---------------------------------------------------------------------------
-// 模块级 WS 诊断缓冲：记录最近 50 条 WS 事件/异常，供 /debug 端点读取。
-// 用于排查「101 握手成功但事件回调未派发/无数据回传」类平台层问题。
+// VLESS 连接状态机（两种升级模式共用）
 // ---------------------------------------------------------------------------
-const wsDiag: string[] = [];
 
-function diag(msg: string) {
-  const line = `${new Date().toISOString()} ${msg}`;
-  wsDiag.push(line);
-  if (wsDiag.length > 50) wsDiag.shift();
-  console.log('[ws-diag]', line);
+interface VlessConnection {
+  handleChunk(chunk: Buffer): void;
+  handleEarlyData(): void;
+  destroy(): void;
 }
 
-export function getWsDiag(): string[] {
-  return wsDiag;
-}
-
-// ---------------------------------------------------------------------------
-// VLESS over WebSocket（事件驱动）
-// ---------------------------------------------------------------------------
-
-/**
- * @param {any} request
- */
-function createVlessWebSocketHandler(request: any) {
-  // ---- 每个连接的独立状态 ----
+function createVlessConnection(wsRef: { current: any }, request: any): VlessConnection {
   let address = '';
   let portWithRandomLog = '';
   const log = (info: string, event?: any) => {
     console.log(`[${address}:${portWithRandomLog}] ${info}`, event || '');
   };
 
-  const earlyDataHeader: any = request.headers.get('sec-websocket-protocol') || '';
+  const earlyDataHeader: string = request?.headers?.get('sec-websocket-protocol') || '';
 
-  /** 当前 TCP 出站 socket */
   let remoteSocket: any = null;
-  /** 首包远端数据前要拼的 VLESS 响应头 */
   let vlessHeaderPending: Buffer | null = null;
   let isDns = false;
-  /** DNS 场景下的长度前缀重组缓冲 */
   let dnsBuf: Buffer = Buffer.alloc(0);
-  /** DNS 场景首包要拼的 VLESS 响应头 */
   let dnsHeaderPending: Buffer | null = null;
   let retried = false;
 
-  let wsRef: any = null;
+  function isWsOpen(ws: any): boolean {
+    return ws && (ws.readyState === undefined || ws.readyState === 1 || ws.readyState === 'open');
+  }
 
-  /**
-   * 处理客户端发来的一个数据块（VLESS 协议头 / 后续流数据 / DNS 数据）
-   */
-  function handleClientChunk(ws: any, chunk: Buffer) {
+  function handleDns(chunk: Buffer) {
+    dnsBuf = Buffer.concat([dnsBuf, chunk]);
+    void (async () => {
+      try {
+        while (dnsBuf.length >= 2) {
+          const len = dnsBuf.readUInt16BE(0);
+          if (dnsBuf.length < 2 + len) break;
+          const query = dnsBuf.subarray(2, 2 + len);
+          dnsBuf = dnsBuf.subarray(2 + len);
+
+          const resp = await fetch('https://1.1.1.1/dns-query', {
+            method: 'POST',
+            headers: { 'content-type': 'application/dns-message' },
+            body: query,
+          });
+          const result = Buffer.from(await resp.arrayBuffer());
+          const udpSizeBuffer = Buffer.from([(result.length >> 8) & 0xff, result.length & 0xff]);
+          if (!isWsOpen(wsRef.current)) return;
+          log(`doh success and dns message length is ${result.length}`);
+          if (dnsHeaderPending) {
+            wsRef.current.send(Buffer.concat([dnsHeaderPending, udpSizeBuffer, result]));
+            dnsHeaderPending = null;
+          } else {
+            wsRef.current.send(Buffer.concat([udpSizeBuffer, result]));
+          }
+        }
+      } catch (err: any) {
+        log('dns udp has error', err);
+      }
+    })();
+  }
+
+  function connectAndWrite(host: string, port: number, initialData: Buffer, isRetry: boolean) {
+    let hasIncomingData = false;
+    const socket = net.connect({ host, port: Number(port) });
+    socket.setNoDelay(true);
+    remoteSocket = socket;
+    log(`${isRetry ? 'retry connected' : 'connected'} to ${host}:${port}`);
+    report('tcp connect', `${host}:${port} retry=${isRetry}`);
+
+    const CONNECT_TIMEOUT_MS = 8000;
+    const connectTimer = setTimeout(() => {
+      log(`tcp connect timeout (${CONNECT_TIMEOUT_MS}ms) to ${host}:${port}`);
+      socket.destroy();
+    }, CONNECT_TIMEOUT_MS);
+    socket.once('connect', () => { clearTimeout(connectTimer); report('tcp connected', `${host}:${port}`); });
+
+    socket.on('data', (d: Buffer) => {
+      hasIncomingData = true;
+      const ws = wsRef.current;
+      if (!isWsOpen(ws)) return;
+      if (vlessHeaderPending) {
+        ws.send(Buffer.concat([vlessHeaderPending, d]));
+        vlessHeaderPending = null;
+      } else {
+        ws.send(d);
+      }
+    });
+
+    socket.on('close', () => {
+      clearTimeout(connectTimer);
+      log(`tcp socket closed, hasIncomingData=${hasIncomingData}`);
+      report('tcp close', `hasIncomingData=${hasIncomingData} retry=${isRetry}`);
+      if (!hasIncomingData && !isRetry && !retried) {
+        retried = true;
+        connectAndWrite(proxyIP || host, port, initialData, true);
+        return;
+      }
+      const ws = wsRef.current;
+      try {
+        if (ws && (isWsOpen(ws) || ws.readyState === 2)) ws.close();
+      } catch (error) {
+        console.error('safeCloseWS error', error);
+      }
+    });
+
+    socket.on('error', (err: any) => {
+      log('tcp socket error', err?.message || err);
+      report('tcp error', err?.message || err);
+      try { if (isWsOpen(wsRef.current)) wsRef.current.send(`TCP-ERR: ${err?.message || err}`); } catch { /* ignore */ }
+      socket.destroy();
+    });
+
+    socket.write(initialData);
+  }
+
+  function handleChunk(chunk: Buffer) {
+    const ws = wsRef.current;
     if (isDns) {
-      handleDns(ws, chunk);
+      handleDns(chunk);
       return;
     }
     if (remoteSocket) {
@@ -132,6 +240,7 @@ function createVlessWebSocketHandler(request: any) {
     portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '} `;
     if (hasError) {
       log(`vless header error: ${message}`);
+      report('vless header error', message);
       try { ws.close(); } catch { /* ignore */ }
       return;
     }
@@ -147,184 +256,143 @@ function createVlessWebSocketHandler(request: any) {
       }
       isDns = true;
       dnsHeaderPending = vlessResponseHeader;
-      handleDns(ws, rawClientData);
+      handleDns(rawClientData);
       return;
     }
 
-    // 远端首包数据前需拼上 VLESS 响应头 ["version", 0]
     vlessHeaderPending = vlessResponseHeader;
     connectAndWrite(addressRemote, portRemote, rawClientData, false);
   }
 
-  /**
-   * 出站 TCP：net.connect，远端数据回写 ws；首连无数据则按 CF 原逻辑用 PROXYIP 重试
-   */
-  function connectAndWrite(host: string, port: number, initialData: Buffer, isRetry: boolean) {
-    let hasIncomingData = false;
-    const socket = net.connect({ host, port: Number(port) });
-    socket.setNoDelay(true);
-    remoteSocket = socket;
-    log(`${isRetry ? 'retry connected' : 'connected'} to ${host}:${port}`);
-
-    // 连接超时保护：不可达目标会 SYN 挂起，必须在平台墙钟限制内快速失败
-    const CONNECT_TIMEOUT_MS = 8000;
-    const connectTimer = setTimeout(() => {
-      log(`tcp connect timeout (${CONNECT_TIMEOUT_MS}ms) to ${host}:${port}`);
-      socket.destroy(); // 触发 close -> 触发 PROXYIP 重试或关闭
-    }, CONNECT_TIMEOUT_MS);
-    socket.once('connect', () => clearTimeout(connectTimer));
-
-    socket.on('data', (d: Buffer) => {
-      hasIncomingData = true;
-      if (!isWsOpen(wsRef)) return;
-      if (vlessHeaderPending) {
-        wsRef.send(Buffer.concat([vlessHeaderPending, d]));
-        vlessHeaderPending = null;
-      } else {
-        wsRef.send(d);
-      }
-    });
-
-    socket.on('close', () => {
-      clearTimeout(connectTimer);
-      log(`tcp socket closed, hasIncomingData=${hasIncomingData}`);
-      if (!hasIncomingData && !isRetry && !retried) {
-        // 首连无回源数据：按原版逻辑改走 PROXYIP 重试
-        retried = true;
-        connectAndWrite(proxyIP || host, port, initialData, true);
-        return;
-      }
-      safeCloseWS(wsRef);
-    });
-
-    socket.on('error', (err: any) => {
-      log('tcp socket error', err?.message || err);
-      // 把错误回传客户端，便于线上自诊断（客户端可读到服务端失败原因）
-      try { if (isWsOpen(wsRef)) wsRef.send(`TCP-ERR: ${err?.message || err}`); } catch { /* ignore */ }
-      socket.destroy();
-    });
-
-    // 未连上前 write 会被 Node 缓冲，连上后自动发出
-    socket.write(initialData);
-  }
-
-  /**
-   * DNS over HTTPS：VLESS UDP(53) 数据为 [2字节长度][DNS 查询] 帧
-   */
-  async function handleDns(ws: any, chunk: Buffer) {
-    try {
-      dnsBuf = Buffer.concat([dnsBuf, chunk]);
-      while (dnsBuf.length >= 2) {
-        const len = dnsBuf.readUInt16BE(0);
-        if (dnsBuf.length < 2 + len) break;
-        const query = dnsBuf.subarray(2, 2 + len);
-        dnsBuf = dnsBuf.subarray(2 + len);
-
-        const resp = await fetch('https://1.1.1.1/dns-query', {
-          method: 'POST',
-          headers: { 'content-type': 'application/dns-message' },
-          body: query,
-        });
-        const result = Buffer.from(await resp.arrayBuffer());
-        const udpSizeBuffer = Buffer.from([(result.length >> 8) & 0xff, result.length & 0xff]);
-        if (!isWsOpen(wsRef)) return;
-        log(`doh success and dns message length is ${result.length}`);
-        if (dnsHeaderPending) {
-          wsRef.send(Buffer.concat([dnsHeaderPending, udpSizeBuffer, result]));
-          dnsHeaderPending = null;
-        } else {
-          wsRef.send(Buffer.concat([udpSizeBuffer, result]));
-        }
-      }
-    } catch (err: any) {
-      log('dns udp has error', err);
+  function handleEarlyData() {
+    const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
+    if (error) {
+      report('early data decode error', error?.message || error);
+      try { wsRef.current.close(); } catch { /* ignore */ }
+      return;
+    }
+    if (earlyData) {
+      handleChunk(Buffer.from(earlyData));
     }
   }
 
+  function destroy() {
+    if (remoteSocket) {
+      remoteSocket.destroy();
+      remoteSocket = null;
+    }
+  }
+
+  return { handleChunk, handleEarlyData, destroy };
+}
+
+// ---------------------------------------------------------------------------
+// 模式 B：官方 handlers 形态
+// ---------------------------------------------------------------------------
+
+function createVlessWebSocketHandler(request: any) {
+  const wsRef = { current: null as any };
+  let conn: VlessConnection | null = null;
+
   return {
     async onopen(ws: any, req: any) {
-      wsRef = ws;
-      diag(`onopen fired, ws keys=[${Object.keys(ws || {}).join(',')}], typeof send=${typeof ws?.send}`);
-      log('websocket opened');
+      wsRef.current = ws;
+      report('onopen', `keys=[${Object.keys(ws || {}).join(',')}], send=${typeof ws?.send}`);
       try {
-        // 与官方模板一致：open 后立即回发一条消息，验证服务端 send 通道可用
         ws.send('ready');
-        diag("onopen sent 'ready'");
-        // 处理 0-RTT early data（v2ray 客户端通过 sec-websocket-protocol 携带）
-        const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
-        if (error) {
-          log('early data decode error', error);
-          try { ws.send(`EARLY-DATA-ERR: ${error?.message || error}`); } catch { /* ignore */ }
-          try { ws.close(); } catch { /* ignore */ }
-          return;
-        }
-        if (earlyData) {
-          handleClientChunk(ws, Buffer.from(earlyData));
-        }
+        report("onopen sent 'ready'");
+        conn = createVlessConnection(wsRef, req || request);
+        conn.handleEarlyData();
       } catch (err: any) {
-        diag(`onopen error: ${err?.message || err}`);
-        log('onopen error', err);
+        report('onopen error', err?.message || err);
         try { ws.send(`OPEN-ERR: ${err?.message || err}`); } catch { /* ignore */ }
         try { ws.close(); } catch { /* ignore */ }
       }
     },
 
     async onmessage(ws: any, message: any, isBinary: boolean) {
-      diag(`onmessage fired, len=${message?.byteLength ?? message?.length ?? '?'}, isBinary=${isBinary}`);
-      wsRef = ws;
+      wsRef.current = ws;
       try {
+        report('onmessage', `len=${message?.byteLength ?? message?.length ?? '?'} binary=${isBinary}`);
         const chunk = toBuffer(message, isBinary);
         if (!chunk) return;
-        handleClientChunk(ws, chunk);
+        if (!conn) conn = createVlessConnection(wsRef, request);
+        conn.handleChunk(chunk);
       } catch (err: any) {
-        log('handleClientChunk error', err);
+        report('onmessage error', err?.message || err);
         try { ws.send(`MSG-ERR: ${err?.message || err}`); } catch { /* ignore */ }
         try { ws.close(); } catch { /* ignore */ }
       }
     },
 
     onclose(ws: any, code: number, reason: Buffer) {
-      diag(`onclose fired, code=${code}, reason=${reason?.toString?.() || ''}`);
-      log('websocket closed', `${code} ${reason?.toString?.() || ''}`);
-      if (remoteSocket) {
-        remoteSocket.destroy();
-        remoteSocket = null;
-      }
+      report('onclose', `code=${code} reason=${reason?.toString?.() || ''}`);
+      conn?.destroy();
     },
 
     onerror(ws: any, error: Error) {
-      diag(`onerror fired: ${error?.message || error}`);
-      log('websocket error', error?.message || error);
-      try { if (isWsOpen(ws)) ws.send(`WS-ERR: ${error?.message || error}`); } catch { /* ignore */ }
-      if (remoteSocket) {
-        remoteSocket.destroy();
-        remoteSocket = null;
-      }
+      report('onerror', error?.message || error);
+      try { if (ws) ws.send(`WS-ERR: ${error?.message || error}`); } catch { /* ignore */ }
+      conn?.destroy();
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// 模式 A：CF 风格 WebSocketPair
+// ---------------------------------------------------------------------------
+
+function wirePairServer(server: any, request: any) {
+  const wsRef = { current: server };
+  report('pair mode: wiring server socket', `keys=[${Object.keys(server || {}).join(',')}]`);
+
+  try {
+    if (typeof server.accept === 'function') {
+      server.accept();
+      report('pair mode: server.accept() ok');
+    } else if (typeof server.addEventListener !== 'function') {
+      report('pair mode: server socket has neither accept nor addEventListener');
+      return;
+    }
+
+    let conn: VlessConnection | null = null;
+    const ensureConn = () => conn || (conn = createVlessConnection(wsRef, request));
+
+    // 0-RTT early data
+    const { earlyData, error } = base64ToArrayBuffer(request?.headers?.get('sec-websocket-protocol') || '');
+    if (error) {
+      report('pair mode: early data decode error', error?.message || error);
+    } else if (earlyData) {
+      ensureConn().handleChunk(Buffer.from(earlyData));
+      report('pair mode: early data dispatched');
+    }
+
+    server.addEventListener?.('message', (ev: any) => {
+      report('pair onmessage', `len=${ev?.data?.byteLength ?? ev?.data?.length ?? '?'}`);
+      try {
+        const chunk = toBuffer(ev.data, true);
+        if (chunk) ensureConn().handleChunk(chunk);
+      } catch (err: any) {
+        report('pair onmessage error', err?.message || err);
+      }
+    });
+    server.addEventListener?.('close', (ev: any) => {
+      report('pair onclose', `code=${ev?.code ?? '?'}`);
+      conn?.destroy();
+    });
+    server.addEventListener?.('error', (ev: any) => {
+      report('pair onerror', ev?.message || JSON.stringify(ev) || 'unknown');
+      conn?.destroy();
+    });
+  } catch (err: any) {
+    report('pair wiring error', err?.message || err);
+  }
 }
 
 // ---------------------------------------------------------------------------
 // 工具函数
 // ---------------------------------------------------------------------------
 
-function isWsOpen(ws: any): boolean {
-  return ws && (ws.readyState === undefined || ws.readyState === 1);
-}
-
-function safeCloseWS(ws: any) {
-  try {
-    if (isWsOpen(ws) || ws?.readyState === 2) {
-      ws.close();
-    }
-  } catch (error) {
-    console.error('safeCloseWS error', error);
-  }
-}
-
-/**
- * 把 ws 消息统一转成 Buffer
- */
 function toBuffer(message: any, isBinary: boolean): Buffer | null {
   if (typeof message === 'string') return Buffer.from(message);
   if (Buffer.isBuffer(message)) return message;
@@ -339,7 +407,6 @@ function base64ToArrayBuffer(base64Str: string): { earlyData: ArrayBuffer | null
     return { earlyData: null, error: null };
   }
   try {
-    // go use modified Base64 for URL rfc4648 which js atob not support
     base64Str = base64Str.replace(/-/g, '+').replace(/_/g, '/');
     const decode = atob(base64Str);
     const arryBuffer = Uint8Array.from(decode, (c) => c.charCodeAt(0));
@@ -417,11 +484,8 @@ export function processVlessHeader(buf: Buffer, uid: string) {
   }
 
   const optLength = buf[17];
-  // skip opt for now
-
   const command = buf[18 + optLength];
 
-  // 0x01 TCP / 0x02 UDP / 0x03 MUX
   if (command === 1) {
   } else if (command === 2) {
     isUDP = true;
@@ -432,7 +496,6 @@ export function processVlessHeader(buf: Buffer, uid: string) {
     };
   }
   const portIndex = 18 + optLength + 1;
-  // port is big-Endian in raw data etc 80 == 0x005d
   const portRemote = buf.readUInt16BE(portIndex);
 
   const addressIndex = portIndex + 2;
@@ -452,13 +515,11 @@ export function processVlessHeader(buf: Buffer, uid: string) {
       break;
     case 3: {
       addressLength = 16;
-      // 2001:0db8:85a3:0000:0000:8a2e:0370:7334
       const ipv6: string[] = [];
       for (let i = 0; i < 8; i++) {
         ipv6.push(buf.readUInt16BE(addressValueIndex + i * 2).toString(16));
       }
       addressValue = ipv6.join(':');
-      // seems no need add [] for ipv6
       break;
     }
     default:

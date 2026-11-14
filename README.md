@@ -9,6 +9,7 @@
 | `import { connect } from 'cloudflare:sockets'` | Node.js `net.connect`（事件驱动桥接 WS 回调，带 8 秒连接超时） |
 | `WebSocketPair`（CF 专有） | **EdgeOne 官方 WS API**：handler 对升级请求返回 `{ websocket: { onopen, onmessage, onclose, onerror } }`，平台负责 101 握手并回调事件。⚠️ 运行时不存在 `WebSocketPair`，使用会导致升级 500 |
 | WS 处理在 fetch 入口 | **官方同形态文件**：`node-functions/websocket.ts`（文件名与官方 WS 模板一致，平台的 WS 桥接按此文件名挂接）。`package.json` 同步对齐官方：`"type": "commonjs"` + 依赖 `ws` |
+| WS 升级 API | **双模式**：`handlers`（官方 `{websocket: onopen/onmessage/onclose/onerror}` 形态，默认）与 `pair`（CF 风格 `WebSocketPair` + `Response(101, webSocket)`），可用查询参数 `?ws-mode=pair` 或环境变量 `WS_MODE` 切换 |
 | `env.UUID` / `env.PROXYIP` | `context.env.UUID` / `context.env.PROXYIP`（Pages 控制台环境变量） |
 | `request.cf`（CF 请求指纹） | 已移除，首页改为静态说明页 |
 | WS 路径 `/?ed=2048` | **`/vless?ed=2048`**（`websocket.ts` 同时接受 `/websocket`、`/ws`、`/vless` 三个路径） |

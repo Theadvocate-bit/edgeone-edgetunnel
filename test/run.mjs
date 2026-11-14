@@ -27,6 +27,29 @@ for (const [entry, out] of [
 const { onRequest: vlessOnRequest } = await import(pathToFileURL(path.join(tmpDir, 'websocket.mjs')).href);
 const { onRequest: defaultOnRequest } = await import(pathToFileURL(path.join(tmpDir, 'default.mjs')).href);
 
+// --- WebSocketPair mock（模拟 CF/EdgeOne pair 模式运行时） ---
+class PairMockWS {
+  constructor() {
+    this.sent = [];
+    this.readyState = 1;
+    this.listeners = {};
+    this.canSend = false; // accept() 之后才允许 send（模拟真实状态）
+  }
+  accept() { this.canSend = true; }
+  addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
+  send(d) { if (!this.canSend) throw new Error('send before accept'); this.sent.push(Buffer.isBuffer(d) ? d : Buffer.from(new Uint8Array(d))); }
+  close() { this.readyState = 3; }
+  emit(type, data) { (this.listeners[type] || []).forEach(fn => fn(data)); }
+}
+globalThis.__pairs = [];
+globalThis.WebSocketPair = class {
+  constructor() {
+    this[0] = { client: true }; // 平台侧拿走的客户端 socket
+    this[1] = new PairMockWS(); // 服务端 socket
+    globalThis.__pairs.push(this);
+  }
+};
+
 // 2. 测试逻辑
 class MockWS {
   constructor() {
@@ -105,7 +128,45 @@ async function main() {
     allOk = (await testWsUpgrade('ws /ws ipv4', request, buf)) && allOk;
   }
 
-  // --- 4. 非法路径拒绝 400 ---
+  // --- 4. pair 模式（CF 风格 WebSocketPair）+ early data ---
+  {
+    const buf = buildVlessRequest('example.com', 80,
+      'GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n');
+    const b64 = buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const request = new Request('https://test.edgeone.app/vless?ed=2048&ws-mode=pair', {
+      headers: { upgrade: 'websocket', 'sec-websocket-protocol': b64 },
+    });
+    // Node 的 Response 禁止 101；本地用允许 101 的 mock 替换（真实平台内部处理）
+    const RealResp = globalThis.Response;
+    globalThis.Response = class {
+      constructor(body, init) {
+        this.status = init?.status ?? 200;
+        this.webSocket = init?.webSocket;
+        this.headers = new RealResp(null, init?.headers ? { headers: init.headers } : undefined).headers;
+        this.__body = body;
+      }
+    };
+    let resp;
+    try {
+      resp = await vlessOnRequest({ request, env: {}, waitUntil: () => {} });
+    } finally {
+      globalThis.Response = RealResp;
+    }
+    const is101 = resp && resp.status === 101;
+    let dataOk = false;
+    if (is101) {
+      const server = globalThis.__pairs.at(-1)?.[1];
+      await new Promise(r => setTimeout(r, 6000));
+      const total = Buffer.concat(server?.sent || []);
+      dataOk = total.length > 2 && total.toString('utf8', 2).includes('HTTP/1.1');
+      console.log(`[ws pair-mode] status=${resp.status}, received ${total.length} bytes, head=${total.subarray(0, 4).toString('hex')} -> ${dataOk ? 'PASS ✅' : 'FAIL ❌'}`);
+    } else {
+      console.log(`[ws pair-mode] status=${resp?.status} (期望 101) -> FAIL ❌`);
+    }
+    allOk = allOk && is101 && dataOk;
+  }
+
+  // --- 5. 非法路径拒绝 400 ---
   {
     const request = new Request('https://test.edgeone.app/other', {
       headers: { upgrade: 'websocket' },
