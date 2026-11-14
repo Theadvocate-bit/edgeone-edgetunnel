@@ -174,6 +174,8 @@ function createVlessWebSocketHandler(request: any) {
 
     socket.on('error', (err: any) => {
       log('tcp socket error', err?.message || err);
+      // 把错误回传客户端，便于线上自诊断（客户端可读到服务端失败原因）
+      try { if (isWsOpen(wsRef)) wsRef.send(`TCP-ERR: ${err?.message || err}`); } catch { /* ignore */ }
       socket.destroy();
     });
 
@@ -218,26 +220,36 @@ function createVlessWebSocketHandler(request: any) {
     async onopen(ws: any, req: any) {
       wsRef = ws;
       log('websocket opened');
-      // 处理 0-RTT early data（v2ray 客户端通过 sec-websocket-protocol 携带）
-      const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
-      if (error) {
-        log('early data decode error', error);
+      try {
+        // 与官方模板一致：open 后立即回发一条消息，验证服务端 send 通道可用
+        ws.send('ready');
+        // 处理 0-RTT early data（v2ray 客户端通过 sec-websocket-protocol 携带）
+        const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
+        if (error) {
+          log('early data decode error', error);
+          try { ws.send(`EARLY-DATA-ERR: ${error?.message || error}`); } catch { /* ignore */ }
+          try { ws.close(); } catch { /* ignore */ }
+          return;
+        }
+        if (earlyData) {
+          handleClientChunk(ws, Buffer.from(earlyData));
+        }
+      } catch (err: any) {
+        log('onopen error', err);
+        try { ws.send(`OPEN-ERR: ${err?.message || err}`); } catch { /* ignore */ }
         try { ws.close(); } catch { /* ignore */ }
-        return;
-      }
-      if (earlyData) {
-        handleClientChunk(ws, Buffer.from(earlyData));
       }
     },
 
     async onmessage(ws: any, message: any, isBinary: boolean) {
       wsRef = ws;
-      const chunk = toBuffer(message, isBinary);
-      if (!chunk) return;
       try {
+        const chunk = toBuffer(message, isBinary);
+        if (!chunk) return;
         handleClientChunk(ws, chunk);
       } catch (err: any) {
         log('handleClientChunk error', err);
+        try { ws.send(`MSG-ERR: ${err?.message || err}`); } catch { /* ignore */ }
         try { ws.close(); } catch { /* ignore */ }
       }
     },
@@ -252,6 +264,7 @@ function createVlessWebSocketHandler(request: any) {
 
     onerror(ws: any, error: Error) {
       log('websocket error', error?.message || error);
+      try { if (isWsOpen(ws)) ws.send(`WS-ERR: ${error?.message || error}`); } catch { /* ignore */ }
       if (remoteSocket) {
         remoteSocket.destroy();
         remoteSocket = null;

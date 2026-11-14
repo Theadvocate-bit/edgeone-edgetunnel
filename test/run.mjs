@@ -162,6 +162,11 @@ async function main() {
         headers: { host: 'internal.edgeone.internal', 'x-forwarded-host': 'my.domain.com' },
       }), {}, 'my.domain.com') && allOk;
 
+    allOk = await checkHost('eo-pages-host',
+      new Request(`https://internal.qcloudteo.com/${uuid}`, {
+        headers: { host: 'internal.qcloudteo.com', 'eo-pages-host': 'nali.lovie.me' },
+      }), {}, 'nali.lovie.me') && allOk;
+
     allOk = await checkHost('custom-domain-env',
       new Request(`https://whatever.example.com/${uuid}`, {
         headers: { host: 'whatever.example.com', 'x-forwarded-host': 'ignored.com' },

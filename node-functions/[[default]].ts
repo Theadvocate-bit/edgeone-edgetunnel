@@ -71,10 +71,11 @@ export async function onRequest(context: any) {
 
 /**
  * 解析客户端配置应使用的域名。
- * 优先级：CUSTOM_DOMAIN 环境变量 > X-Forwarded-Host > url.hostname > Host 头。
+ * 优先级：CUSTOM_DOMAIN 环境变量 > eo-pages-host（EdgeOne 平台保留的原始域名）
+ *        > X-Forwarded-Host > url.hostname > Host 头。
  *
- * 背景：Pages 平台把请求转发给函数时，Host 头可能被改写为内部回源地址，
- * 直接用 Host 头生成的配置会导致客户端 SNI/Host/address 跟不到自定义域名。
+ * 背景：Pages 平台把请求转发给函数时，Host 头会被改写为内部回源地址，
+ * 但平台会在 eo-pages-host 头中保留用户实际访问的域名。
  */
 function resolveHostName(request: any, env: any): string {
   // 1. 显式指定（自定义域名场景最可靠，推荐）
@@ -82,19 +83,24 @@ function resolveHostName(request: any, env: any): string {
   if (custom) {
     return String(custom).trim().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
   }
-  // 2. 反代平台保留的原始域名
+  // 2. EdgeOne 平台保留的原始访问域名
+  const eoh = request.headers.get('eo-pages-host');
+  if (eoh) {
+    return eoh.trim();
+  }
+  // 3. 反代平台保留的原始域名
   const xfh = request.headers.get('x-forwarded-host');
   if (xfh) {
     return xfh.split(',')[0].trim();
   }
-  // 3. 请求 URL 的 hostname（排除明显的内部地址）
+  // 4. 请求 URL 的 hostname（排除明显的内部地址）
   try {
     const u = new URL(request.url);
     if (u.hostname && !u.hostname.endsWith('.internal')) {
       return u.hostname;
     }
   } catch { /* ignore */ }
-  // 4. 兜底 Host 头
+  // 5. 兜底 Host 头
   return request.headers.get('host') || '';
 }
 
